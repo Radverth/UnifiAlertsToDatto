@@ -195,15 +195,33 @@ function Get-UniFiDevices {
 
     $deviceMap = @{}
 
+    # Pre-fetch bulk device lists per unique hostId and cache them.
+    # GET /v1/devices?hostIds[]=... is the only reliably working device endpoint
+    # in the Site Manager API. For controllers with a single site we can attribute
+    # all returned devices to that site. For shared controllers we skip the bulk
+    # fallback (can't distinguish which device belongs to which site).
+    $hostSiteCount = @{}
+    foreach ($s in $Sites) { $hostSiteCount[$s.hostId] = ($hostSiteCount[$s.hostId] + 1) }
+
+    $bulkDeviceCache = @{}
+    foreach ($hostId in ($hostSiteCount.Keys | Where-Object { $hostSiteCount[$_] -eq 1 })) {
+        $baseHostId = $hostId -replace ':.+$', ''
+        try {
+            $bulkDeviceCache[$hostId] = Get-AllPages -Uri "$BaseUrl/devices?hostIds[]=$baseHostId" -ApiKey $ApiKey
+        } catch {
+            $bulkDeviceCache[$hostId] = $null
+        }
+    }
+
     if ($TestMode) {
         Write-Host "`n=== DEVICE CHECK ==="
     }
 
     foreach ($site in $Sites) {
-        $siteId  = $site.siteId
-        $hostId  = $site.hostId
+        $siteId   = $site.siteId
+        $hostId   = $site.hostId
         $siteName = $site.meta.name
-        $counts  = $site.statistics.counts
+        $counts   = $site.statistics.counts
 
         # Tier 1 — fast check using site counts (treat null as 0 for sites with missing statistics)
         if ($UseTwoTierDeviceCheck -and [int]($counts.offlineDevice) -eq 0) {
@@ -218,23 +236,30 @@ function Get-UniFiDevices {
             Write-Host "  FETCH (Tier 2) $siteName — $($counts.offlineDevice) offline, fetching devices..."
         }
 
-        # Tier 2 — per-site device call, trying multiple endpoint forms
-        $devices = $null
-        $baseHostId = $hostId -replace ':.+$', ''   # strip :port suffix
+        # Tier 2a — try per-site endpoint forms (may work in future API versions)
+        $devices    = $null
+        $baseHostId = $hostId -replace ':.+$', ''
 
         $endpointsToTry = @(
             "$BaseUrl/hosts/$baseHostId/sites/$siteId/devices",
-            "$BaseUrl/hosts/$hostId/sites/$siteId/devices",
             "$BaseUrl/sites/$siteId/devices"
         )
 
         foreach ($endpoint in $endpointsToTry) {
             try {
                 $devices = Get-AllPages -Uri $endpoint -ApiKey $ApiKey
-                if ($TestMode) { Write-Host "    OK: $endpoint" }
+                if ($TestMode) { Write-Host "    OK (per-site): $endpoint" }
                 break
             } catch {
-                if ($TestMode) { Write-Host "    FAIL ($([int]$_.Exception.Response.StatusCode)): $endpoint" }
+                if ($TestMode) { Write-Host "    FAIL: $endpoint" }
+            }
+        }
+
+        # Tier 2b — fall back to bulk host endpoint for single-site controllers
+        if ($null -eq $devices -and $bulkDeviceCache.ContainsKey($hostId)) {
+            $devices = $bulkDeviceCache[$hostId]
+            if ($devices -and $TestMode) {
+                Write-Host "    OK (bulk host fallback): $BaseUrl/devices?hostIds[]=$baseHostId"
             }
         }
 
@@ -246,7 +271,11 @@ function Get-UniFiDevices {
                 }
             }
         } else {
-            Write-Host "  WARNING: All device endpoints returned 404 for site '$siteName' — using Tier 1 count only."
+            if ($hostSiteCount[$hostId] -gt 1) {
+                Write-Host "  WARNING: Cannot retrieve per-device detail for '$siteName' — shared controller, bulk endpoint not usable."
+            } else {
+                Write-Host "  WARNING: Could not fetch devices for '$siteName' — using Tier 1 count only."
+            }
             $deviceMap[$siteId] = 'ERROR'
         }
     }
