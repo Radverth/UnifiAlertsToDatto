@@ -24,16 +24,16 @@ $DattoNetworksVarName = 'UniFiNetworks' # Datto site variable: "HostID|SiteID,Ho
 $UseTwoTierDeviceCheck = $true   # $false = always fetch full device detail
 
 # --- Alert Thresholds ---
-$ThresholdPacketLossWarnPct  = 50
+$ThresholdPacketLossWarnPct  = 50    # kept for future use
 $ThresholdPacketLossCritPct  = 55
 $ThresholdAvgLatencyMs       = 100
 $ThresholdWanUptimeCritPct   = 99.0
 $ThresholdWanUptimeWarnPct   = 99.9
-$IspMetricsWindowMinutes     = 30   # Min 5, max 1440
+$ThresholdTxRetryWarnPct     = 25    # TX retry rate — Warning
+$ThresholdTxRetryCritPct     = 40    # TX retry rate — Critical
 
-# --- API Base URLs ---
-$BaseUrl        = 'https://api.ui.com/v1'
-$IspMetricsUrl  = 'https://api.ui.com/ea/isp-metrics/5m/query'
+# --- API Base URL ---
+$BaseUrl = 'https://api.ui.com/v1'
 
 # ==============================================================================
 # FUNCTIONS
@@ -288,85 +288,58 @@ function Get-UniFiDevices {
     return $deviceMap
 }
 
-function Get-IspMetrics {
-    param(
-        [array]  $Sites,
-        [string] $ApiKey
-    )
+function Get-SiteWanMetrics {
+    <#
+    Extracts WAN and TX-retry metrics from the already-fetched sites data — no extra
+    API call needed. Data comes from statistics.percentages and statistics.wans which
+    are returned by GET /v1/sites.
 
-    $endTime   = [datetime]::UtcNow
-    $beginTime = $endTime.AddMinutes(-[Math]::Max(5, [Math]::Min(1440, $IspMetricsWindowMinutes)))
-
-    $siteRequests = $Sites | ForEach-Object {
-        @{
-            hostId         = $_.hostId
-            siteId         = $_.siteId
-            beginTimestamp = $beginTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
-            endTimestamp   = $endTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
-        }
-    }
-
-    $body = @{ sites = $siteRequests }
-
-    $headers = @{
-        'X-API-Key'    = $ApiKey
-        'Accept'       = 'application/json'
-        'Content-Type' = 'application/json'
-    }
+    Skips sites where statistics is null (e.g. unmanaged/read-only sites) or where
+    wans is empty (client sites on a shared controller without their own gateway).
+    #>
+    param([array] $Sites)
 
     $metricsMap = @{}
 
-    try {
-        $raw      = Invoke-RestMethod -Method POST -Uri $IspMetricsUrl -Headers $headers `
-                        -Body ($body | ConvertTo-Json -Depth 10 -Compress) -ErrorAction Stop
-        $rawData  = $raw.data
-    } catch [System.Net.WebException] {
-        $statusCode = [int]$_.Exception.Response.StatusCode
-        if ($statusCode -eq 502) {
-            Write-Host "WARNING: ISP metrics endpoint returned 502 — no ISP data will be included."
-            return $metricsMap
-        }
-        Write-Host "WARNING: ISP metrics request failed ($statusCode): $_"
-        return $metricsMap
-    } catch {
-        Write-Host "WARNING: ISP metrics request failed: $_"
-        return $metricsMap
-    }
+    foreach ($site in $Sites) {
+        $siteId = $site.siteId
+        $stats  = $site.statistics
+        if ($null -eq $stats) { continue }
 
-    # Group and average buckets per siteId
-    foreach ($siteEntry in $rawData) {
-        $siteId  = $siteEntry.siteId
-        $buckets = $siteEntry.metrics
+        $pct  = $stats.percentages
+        $wans = $stats.wans
 
-        if (-not $buckets -or $buckets.Count -eq 0) {
-            continue
+        # Skip sites with no WAN data (client sites on shared controllers)
+        $hasWan = ($null -ne $wans -and ($wans.PSObject.Properties.Name | Where-Object { $_ -ne 'WAN2' -and $_ -ne 'WAN3' }).Count -gt 0)
+
+        $txRetry    = if ($pct.txRetry)    { [Math]::Round([double]$pct.txRetry, 2) }    else { $null }
+        $wanUptime  = if ($pct.wanUptime -ne $null) { [Math]::Round([double]$pct.wanUptime, 3) } else { $null }
+        $ispName    = $stats.ispInfo.name
+
+        # Per-WAN uptime (primary WAN only — WAN2/WAN3 being 0 is normal for standby links)
+        $primaryWanUptime = $null
+        if ($hasWan -and $wans.WAN) {
+            $primaryWanUptime = if ($wans.WAN.wanUptime -ne $null) { [Math]::Round([double]$wans.WAN.wanUptime, 3) } else { $null }
         }
 
-        $avgLatency  = ($buckets | Measure-Object { $_.wan.avgLatency }  -Average).Average
-        $maxLatency  = ($buckets | Measure-Object { $_.wan.maxLatency }  -Maximum).Maximum
-        $packetLoss  = ($buckets | Measure-Object { $_.wan.packetLoss }  -Average).Average
-        $downKbps    = ($buckets | Measure-Object { $_.wan.download_kbps } -Average).Average
-        $upKbps      = ($buckets | Measure-Object { $_.wan.upload_kbps }   -Average).Average
-        $uptimePct   = ($buckets | Measure-Object { $_.wan.uptime }       -Average).Average
-        $ispName     = $buckets[-1].wan.ispName
-
-        $metricsMap[$siteId] = @{
-            AvgLatency  = [Math]::Round($avgLatency, 1)
-            MaxLatency  = [Math]::Round($maxLatency, 1)
-            PacketLoss  = [Math]::Round($packetLoss, 2)
-            DownKbps    = [Math]::Round($downKbps, 0)
-            UpKbps      = [Math]::Round($upKbps, 0)
-            UptimePct   = [Math]::Round($uptimePct, 3)
-            IspName     = $ispName
+        # Only include in map if we have at least some metric to evaluate
+        if ($null -ne $txRetry -or $null -ne $primaryWanUptime) {
+            $metricsMap[$siteId] = @{
+                TxRetryPct       = $txRetry
+                WanUptimePct     = $primaryWanUptime   # primary WAN only
+                OverallWanUptime = $wanUptime           # rolled-up (from percentages)
+                IspName          = $ispName
+                Wans             = $wans
+            }
         }
     }
 
     if ($TestMode) {
-        Write-Host "`n=== ISP METRICS ==="
+        Write-Host "`n=== WAN / TX METRICS (from sites API) ==="
         foreach ($siteId in $metricsMap.Keys) {
             $m = $metricsMap[$siteId]
-            Write-Host ("  siteId={0}  isp={1}  latency={2}ms  loss={3}%  uptime={4}%  dl={5}kbps  ul={6}kbps" -f
-                $siteId, $m.IspName, $m.AvgLatency, $m.PacketLoss, $m.UptimePct, $m.DownKbps, $m.UpKbps)
+            Write-Host ("  siteId={0}  isp={1}  txRetry={2}%  wanUptime={3}%" -f
+                $siteId, $m.IspName, $m.TxRetryPct, $m.WanUptimePct)
         }
     }
 
@@ -416,15 +389,15 @@ function Build-SiteHealthMap {
         }
 
         $healthMap[$siteId] = @{
-            SiteId          = $siteId
-            SiteName        = $displayName
-            HostId          = $hostId
-            HostName        = $hostName
-            HostConnected   = ($hostRecord.reportedState.state -eq 'connected')
-            SiteCounts      = $site.statistics.counts
-            Devices         = $allDevices
-            OfflineDevices  = $offlineDevices
-            WanMetrics      = $MetricsMap[$siteId]
+            SiteId           = $siteId
+            SiteName         = $displayName
+            HostId           = $hostId
+            HostName         = $hostName
+            HostConnected    = ($hostRecord.reportedState.state -eq 'connected')
+            SiteCounts       = $site.statistics.counts
+            Devices          = $allDevices
+            OfflineDevices   = $offlineDevices
+            WanMetrics       = $MetricsMap[$siteId]
             DeviceFetchError = ($allDevices -eq 'ERROR')
         }
     }
@@ -547,105 +520,29 @@ REMEDIATION:
             }
         }
 
-        # ISP / WAN Metrics
+        # WAN / TX Metrics (sourced from sites API — no separate call needed)
         $wan = $site.WanMetrics
         if ($wan) {
             $ispStr = if ($wan.IspName) { " via $($wan.IspName)" } else { '' }
 
-            # Packet Loss
-            if ($wan.PacketLoss -gt $ThresholdPacketLossCritPct) {
-                $alerts += [PSCustomObject]@{
-                    SiteId      = $siteId
-                    SiteName    = $site.SiteName
-                    Severity    = 'Critical'
-                    Category    = 'ISPPacketLoss'
-                    DeviceName  = ''
-                    DeviceMac   = ''
-                    DeviceModel = ''
-                    Detail      = @"
+            # WAN Uptime (primary WAN only; WAN2/WAN3 = 0 is normal for standby/failover links)
+            $wanUp = $wan.WanUptimePct
+            if ($null -ne $wanUp) {
+                if ($wanUp -lt $ThresholdWanUptimeCritPct) {
+                    $alerts += [PSCustomObject]@{
+                        SiteId      = $siteId
+                        SiteName    = $site.SiteName
+                        Severity    = 'Critical'
+                        Category    = 'WANUptime'
+                        DeviceName  = ''
+                        DeviceMac   = ''
+                        DeviceModel = ''
+                        Detail      = @"
 SITE:       $($site.SiteName)
 SEVERITY:   Critical
 DETECTED:   $detectedAt
-ISSUE:      WAN packet loss $($wan.PacketLoss)%$ispStr (threshold: $ThresholdPacketLossCritPct%).
-            Measured over the last $IspMetricsWindowMinutes minutes. Users are likely experiencing
-            significant connectivity problems.
-
-REMEDIATION:
-  1. Check the ISP status page for reported outages$ispStr.
-  2. Log into the gateway and check the WAN interface for errors or flapping.
-  3. Reboot the ISP router/modem if accessible.
-  4. If persistent, raise a fault with the ISP.
-"@
-                }
-            } elseif ($wan.PacketLoss -gt $ThresholdPacketLossWarnPct) {
-                $alerts += [PSCustomObject]@{
-                    SiteId      = $siteId
-                    SiteName    = $site.SiteName
-                    Severity    = 'Warning'
-                    Category    = 'ISPPacketLoss'
-                    DeviceName  = ''
-                    DeviceMac   = ''
-                    DeviceModel = ''
-                    Detail      = @"
-SITE:       $($site.SiteName)
-SEVERITY:   Warning
-DETECTED:   $detectedAt
-ISSUE:      WAN packet loss $($wan.PacketLoss)%$ispStr (threshold: $ThresholdPacketLossWarnPct%).
-            Measured over the last $IspMetricsWindowMinutes minutes. Users may notice intermittent
-            connectivity issues.
-
-REMEDIATION:
-  1. Monitor — if loss increases above $ThresholdPacketLossCritPct%, escalate to Critical.
-  2. Check the ISP status page for reported issues$ispStr.
-  3. Log into the gateway and check the WAN interface for errors.
-  4. If persistent over the next poll cycle, raise a fault with the ISP.
-"@
-                }
-            }
-
-            # Latency
-            if ($wan.AvgLatency -gt $ThresholdAvgLatencyMs) {
-                $alerts += [PSCustomObject]@{
-                    SiteId      = $siteId
-                    SiteName    = $site.SiteName
-                    Severity    = 'Warning'
-                    Category    = 'ISPLatency'
-                    DeviceName  = ''
-                    DeviceMac   = ''
-                    DeviceModel = ''
-                    Detail      = @"
-SITE:       $($site.SiteName)
-SEVERITY:   Warning
-DETECTED:   $detectedAt
-ISSUE:      WAN average latency $($wan.AvgLatency)ms (peak $($wan.MaxLatency)ms)$ispStr.
-            Threshold: $($ThresholdAvgLatencyMs)ms. Measured over the last $IspMetricsWindowMinutes minutes.
-            Users may experience slow page loads, laggy video calls, or VoIP quality issues.
-
-REMEDIATION:
-  1. Check the ISP status page for reported issues$ispStr.
-  2. Check for bandwidth saturation — high throughput can inflate latency.
-  3. Log into the gateway and review WAN interface statistics.
-  4. If persistent, raise a fault with the ISP referencing the latency figures above.
-"@
-                }
-            }
-
-            # WAN Uptime
-            if ($wan.UptimePct -lt $ThresholdWanUptimeCritPct) {
-                $alerts += [PSCustomObject]@{
-                    SiteId      = $siteId
-                    SiteName    = $site.SiteName
-                    Severity    = 'Critical'
-                    Category    = 'WANUptime'
-                    DeviceName  = ''
-                    DeviceMac   = ''
-                    DeviceModel = ''
-                    Detail      = @"
-SITE:       $($site.SiteName)
-SEVERITY:   Critical
-DETECTED:   $detectedAt
-ISSUE:      WAN uptime $($wan.UptimePct)%$ispStr in the last $IspMetricsWindowMinutes minutes.
-            Threshold: $ThresholdWanUptimeCritPct%. The WAN connection has been dropping repeatedly.
+ISSUE:      Primary WAN uptime $wanUp%$ispStr.
+            Threshold: $ThresholdWanUptimeCritPct%. The WAN connection has been dropping.
             Users are likely experiencing internet outages.
 
 REMEDIATION:
@@ -654,21 +551,21 @@ REMEDIATION:
   3. Log into the gateway and check the WAN interface for link drops or errors.
   4. Raise a fault with the ISP if drops continue — reference the uptime percentage above.
 "@
-                }
-            } elseif ($wan.UptimePct -lt $ThresholdWanUptimeWarnPct) {
-                $alerts += [PSCustomObject]@{
-                    SiteId      = $siteId
-                    SiteName    = $site.SiteName
-                    Severity    = 'Warning'
-                    Category    = 'WANUptime'
-                    DeviceName  = ''
-                    DeviceMac   = ''
-                    DeviceModel = ''
-                    Detail      = @"
+                    }
+                } elseif ($wanUp -lt $ThresholdWanUptimeWarnPct) {
+                    $alerts += [PSCustomObject]@{
+                        SiteId      = $siteId
+                        SiteName    = $site.SiteName
+                        Severity    = 'Warning'
+                        Category    = 'WANUptime'
+                        DeviceName  = ''
+                        DeviceMac   = ''
+                        DeviceModel = ''
+                        Detail      = @"
 SITE:       $($site.SiteName)
 SEVERITY:   Warning
 DETECTED:   $detectedAt
-ISSUE:      WAN uptime $($wan.UptimePct)%$ispStr in the last $IspMetricsWindowMinutes minutes.
+ISSUE:      Primary WAN uptime $wanUp%$ispStr.
             Threshold: $ThresholdWanUptimeWarnPct%. The WAN link has experienced brief drops.
 
 REMEDIATION:
@@ -676,6 +573,61 @@ REMEDIATION:
   2. Check the ISP status page for reported issues$ispStr.
   3. Log into the gateway and review WAN interface event logs.
 "@
+                    }
+                }
+            }
+
+            # TX Retry Rate — high values indicate RF interference or poor wireless conditions
+            $txRetry = $wan.TxRetryPct
+            if ($null -ne $txRetry) {
+                if ($txRetry -gt $ThresholdTxRetryCritPct) {
+                    $alerts += [PSCustomObject]@{
+                        SiteId      = $siteId
+                        SiteName    = $site.SiteName
+                        Severity    = 'Critical'
+                        Category    = 'TxRetry'
+                        DeviceName  = ''
+                        DeviceMac   = ''
+                        DeviceModel = ''
+                        Detail      = @"
+SITE:       $($site.SiteName)
+SEVERITY:   Critical
+DETECTED:   $detectedAt
+ISSUE:      TX retry rate $txRetry% (threshold: $ThresholdTxRetryCritPct%).
+            High retry rates indicate significant RF interference, channel congestion,
+            or failing wireless hardware. Wireless clients will experience poor performance.
+
+REMEDIATION:
+  1. Log into UniFi ($($site.HostName)) and review the RF environment (channel utilisation).
+  2. Check for neighbouring networks on the same channel — adjust channel/width settings.
+  3. Look for physical obstructions or new interference sources near APs.
+  4. Check AP hardware — a failing radio can cause elevated retries.
+  5. Consider enabling auto-channel if not already active.
+"@
+                    }
+                } elseif ($txRetry -gt $ThresholdTxRetryWarnPct) {
+                    $alerts += [PSCustomObject]@{
+                        SiteId      = $siteId
+                        SiteName    = $site.SiteName
+                        Severity    = 'Warning'
+                        Category    = 'TxRetry'
+                        DeviceName  = ''
+                        DeviceMac   = ''
+                        DeviceModel = ''
+                        Detail      = @"
+SITE:       $($site.SiteName)
+SEVERITY:   Warning
+DETECTED:   $detectedAt
+ISSUE:      TX retry rate $txRetry% (threshold: $ThresholdTxRetryWarnPct%).
+            Elevated retries may indicate RF interference or channel congestion.
+            Wireless performance may be degraded.
+
+REMEDIATION:
+  1. Monitor — if retry rate exceeds $ThresholdTxRetryCritPct%, escalate to Critical.
+  2. Log into UniFi ($($site.HostName)) and review the RF environment.
+  3. Check for neighbouring networks on the same channel.
+"@
+                    }
                 }
             }
         }
@@ -846,15 +798,16 @@ function Write-TestOutput {
         }
     }
 
-    Write-Host "`n--- Section 6: ISP Metrics ---"
+    Write-Host "`n--- Section 6: WAN / TX Metrics (from sites API) ---"
     if ($MetricsMap.Count -eq 0) {
-        Write-Host "  No ISP metrics available."
+        Write-Host "  No WAN metrics available (sites may have no gateway or statistics)."
     }
     foreach ($siteId in $MetricsMap.Keys) {
         $m = $MetricsMap[$siteId]
-        $n = ($Sites | Where-Object { $_.siteId -eq $siteId }).meta.name
-        Write-Host ("  {0,-30} isp={1}  latency={2}ms  loss={3}%  uptime={4}%  dl={5}kbps  ul={6}kbps" -f
-            $n, $m.IspName, $m.AvgLatency, $m.PacketLoss, $m.UptimePct, $m.DownKbps, $m.UpKbps)
+        $s = $Sites | Where-Object { $_.siteId -eq $siteId }
+        $lbl = if (-not [string]::IsNullOrWhiteSpace($s.meta.desc)) { $s.meta.desc } else { $s.meta.name }
+        Write-Host ("  {0,-35} isp={1,-22} wanUptime={2}%  txRetry={3}%" -f
+            $lbl, $m.IspName, $m.WanUptimePct, $m.TxRetryPct)
     }
 
     Write-Host "`n--- Section 7: Alerts Before Merge ---"
@@ -952,7 +905,7 @@ function Main {
         }
 
         $deviceMap   = Get-UniFiDevices      -Sites $sites -ApiKey $apiKey
-        $metricsMap  = Get-IspMetrics        -Sites $sites -ApiKey $apiKey
+        $metricsMap  = Get-SiteWanMetrics    -Sites $sites
         $healthMap   = Build-SiteHealthMap   -Hosts $hosts -Sites $sites -DeviceMap $deviceMap -MetricsMap $metricsMap
         $rawAlerts   = Evaluate-Alerts       -HealthMap $healthMap
         $finalAlerts = Merge-Alerts          -Alerts $rawAlerts
