@@ -157,9 +157,26 @@ function Get-AllPages {
 }
 
 function Get-UniFiHosts {
-    param([string] $ApiKey)
+    param(
+        [string]    $ApiKey,
+        [hashtable] $SiteFilter = $null
+    )
 
     $hosts = Get-AllPages -Uri "$BaseUrl/hosts" -ApiKey $ApiKey
+
+    # Trim to only hosts referenced in the filter
+    if ($null -ne $SiteFilter -and $SiteFilter.Count -gt 0) {
+        $hosts = @($hosts | Where-Object {
+            $baseId = $_.id -replace ':.+$', ''
+            $SiteFilter.Keys | Where-Object { ($_ -replace ':.+$', '') -eq $baseId -or $_ -eq $_.id }
+            # match if any filter key equals this host id (with or without suffix)
+            $matched = $false
+            foreach ($fhid in $SiteFilter.Keys) {
+                if (($fhid -replace ':.+$', '') -eq $baseId -or $fhid -eq $_.id) { $matched = $true; break }
+            }
+            $matched
+        })
+    }
 
     if ($TestMode) {
         Write-Host "`n=== HOSTS ($($hosts.Count)) ==="
@@ -175,14 +192,44 @@ function Get-UniFiHosts {
 
 function Get-UniFiSites {
     param(
-        [string] $ApiKey,
-        [array]  $Hosts
+        [string]    $ApiKey,
+        [array]     $Hosts,
+        [hashtable] $SiteFilter = $null
     )
 
-    $sites = Get-AllPages -Uri "$BaseUrl/sites" -ApiKey $ApiKey
+    # If a filter is set, scope the API request to only the relevant host IDs.
+    # This avoids fetching sites for controllers the customer doesn't own.
+    if ($null -ne $SiteFilter -and $SiteFilter.Count -gt 0) {
+        $hostIdParams = ($Hosts | ForEach-Object { "hostIds[]=$([Uri]::EscapeDataString($_.id))" }) -join '&'
+        $uri          = "$BaseUrl/sites?$hostIdParams"
+        $sites        = Get-AllPages -Uri $uri -ApiKey $ApiKey
+
+        # Filter to the exact siteIds listed in the variable
+        $filtered = @($sites | Where-Object {
+            $sid     = $_.siteId
+            $hid     = $_.hostId
+            $baseHid = $hid -replace ':.+$', ''
+            $matched = $false
+            foreach ($fhid in $SiteFilter.Keys) {
+                if (($fhid -replace ':.+$', '') -eq $baseHid -or $fhid -eq $hid) {
+                    if ($SiteFilter[$fhid] -contains $sid) { $matched = $true; break }
+                }
+            }
+            $matched
+        })
+
+        # If the siteIds in the variable matched nothing (misconfigured), fall back to all
+        if ($filtered.Count -eq 0) {
+            Write-Host "WARNING: $DattoNetworksVarName produced no matching sites — querying all sites as fallback."
+            $sites = Get-AllPages -Uri "$BaseUrl/sites" -ApiKey $ApiKey
+        } else {
+            $sites = $filtered
+        }
+    } else {
+        $sites = Get-AllPages -Uri "$BaseUrl/sites" -ApiKey $ApiKey
+    }
 
     if ($TestMode) {
-        # Build lookups needed for display name resolution
         $hostLookup    = @{}; foreach ($h in $Hosts) { $hostLookup[$h.id] = $h }
         $hostSiteCount = @{}; foreach ($s in $sites) { $hostSiteCount[$s.hostId] = ($hostSiteCount[$s.hostId] + 1) }
 
@@ -946,32 +993,10 @@ function Write-TestOutput {
 
 function Main {
     try {
-        $apiKey = Get-UniFiApiKey
-        $hosts  = Get-UniFiHosts -ApiKey $apiKey
-        $sites  = Get-UniFiSites -ApiKey $apiKey -Hosts $hosts
-
-        # --- Proactive customer filtering ---
-        # When $DattoNetworksVarName is set (e.g. "HostID|SiteID,HostID2|SiteID2,..."),
-        # restrict monitoring to only those host/site pairs. Applies in both test and
-        # production mode so you can test a specific customer's scope.
+        $apiKey     = Get-UniFiApiKey
         $siteFilter = Get-ProactiveSiteFilter
-        if ($null -ne $siteFilter) {
-            $before = $sites.Count
-            $sites  = @($sites | Where-Object {
-                $sid     = $_.siteId
-                $hid     = $_.hostId
-                $baseHid = $hid -replace ':.+$', ''
-                $matched = $false
-                foreach ($fhid in $siteFilter.Keys) {
-                    $fbaseHid = $fhid -replace ':.+$', ''
-                    if ($fbaseHid -eq $baseHid -or $fhid -eq $hid) {
-                        if ($siteFilter[$fhid] -contains $sid) { $matched = $true; break }
-                    }
-                }
-                $matched
-            })
-            Write-Host "Filter applied ($DattoNetworksVarName): monitoring $($sites.Count) of $before site(s)."
-        }
+        $hosts      = Get-UniFiHosts -ApiKey $apiKey -SiteFilter $siteFilter
+        $sites      = Get-UniFiSites -ApiKey $apiKey -Hosts $hosts -SiteFilter $siteFilter
 
         $deviceMap   = Get-UniFiDevices      -Sites $sites -Hosts $hosts -ApiKey $apiKey
         $metricsMap  = Get-SiteWanMetrics    -Sites $sites
