@@ -19,7 +19,8 @@ $TestMode          = $true       # $true = terminal output, no Datto markers, no
 $MergeAlerts       = $true       # $true = one alert per site; $false = one per device
 $ApiKeySource      = 'SiteVar'   # 'SiteVar' = $env:UniFiApiKey | 'Script' = $ScriptApiKey
 $ScriptApiKey      = ''          # Local testing only — never deploy with a value here
-$DattoSiteVarName  = 'UniFiApiKey'
+$DattoSiteVarName  = 'UniFiApiKey'   # Datto site or global variable name for the API key
+$DattoNetworksVarName = 'UniFiNetworks' # Datto site variable: "HostID|SiteID,HostID2|SiteID2,..."
 $UseTwoTierDeviceCheck = $true   # $false = always fetch full device detail
 
 # --- Alert Thresholds ---
@@ -42,10 +43,14 @@ function Get-UniFiApiKey {
     if ($ApiKeySource -eq 'Script') {
         $key = $ScriptApiKey
     } else {
+        # Try Datto site variable first, then global (machine-level) variable as fallback
         $key = [System.Environment]::GetEnvironmentVariable($DattoSiteVarName, 'Process')
+        if ([string]::IsNullOrWhiteSpace($key)) {
+            $key = [System.Environment]::GetEnvironmentVariable($DattoSiteVarName, 'Machine')
+        }
     }
     if ([string]::IsNullOrWhiteSpace($key)) {
-        throw "API key is empty. Source='$ApiKeySource'. Ensure the Datto site variable '$DattoSiteVarName' is configured."
+        throw "API key is empty. Set Datto site variable '$DattoSiteVarName' (or a global/account-level variable with the same name), or set `$ApiKeySource = 'Script'` with `$ScriptApiKey."
     }
     return $key
 }
@@ -712,6 +717,32 @@ function Merge-Alerts {
     return $merged
 }
 
+function Get-ProactiveSiteFilter {
+    <#
+    Reads the Datto site variable $DattoNetworksVarName (e.g. "UniFiNetworks") which
+    contains a comma-separated list of "HostID|SiteID" pairs, and returns a hashtable
+    keyed by hostId with a list of allowed siteIds.
+
+    Returns $null if the variable is not set (caller interprets as "no filter").
+    #>
+    $raw = [System.Environment]::GetEnvironmentVariable($DattoNetworksVarName, 'Process')
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+
+    $filter = @{}
+    foreach ($entry in ($raw -split ',')) {
+        $entry = $entry.Trim()
+        if (-not $entry.Contains('|')) { continue }
+        $parts  = $entry -split '\|', 2
+        $hostId = $parts[0].Trim()
+        $siteId = $parts[1].Trim()
+        if (-not $filter.ContainsKey($hostId)) { $filter[$hostId] = [System.Collections.Generic.List[string]]::new() }
+        $filter[$hostId].Add($siteId)
+    }
+
+    if ($filter.Count -eq 0) { return $null }
+    return $filter
+}
+
 function Write-DattoOutput {
     param([array] $Alerts)
 
@@ -866,14 +897,65 @@ function Write-TestOutput {
 
 function Main {
     try {
-        $apiKey    = Get-UniFiApiKey
-        $hosts     = Get-UniFiHosts  -ApiKey $apiKey
-        $sites     = Get-UniFiSites  -ApiKey $apiKey
-        $deviceMap = Get-UniFiDevices -Sites $sites -ApiKey $apiKey
-        $metricsMap = Get-IspMetrics  -Sites $sites -ApiKey $apiKey
-        $healthMap = Build-SiteHealthMap -Hosts $hosts -Sites $sites -DeviceMap $deviceMap -MetricsMap $metricsMap
-        $rawAlerts = Evaluate-Alerts -HealthMap $healthMap
-        $finalAlerts = Merge-Alerts -Alerts $rawAlerts
+        $apiKey = Get-UniFiApiKey
+        $hosts  = Get-UniFiHosts -ApiKey $apiKey
+        $sites  = Get-UniFiSites -ApiKey $apiKey
+
+        # --- Proactive customer filtering (production mode only) ---
+        # When $TestMode = $false, read the Datto site variable $DattoNetworksVarName
+        # (e.g. "UniFiNetworks" = "HostID|SiteID,HostID2|SiteID2,...") and restrict
+        # monitoring to only the listed host/site pairs for this customer.
+        $siteFilter = $null
+        if (-not $TestMode) {
+            $siteFilter = Get-ProactiveSiteFilter
+            if ($null -ne $siteFilter) {
+                $before = $sites.Count
+                $sites  = @($sites | Where-Object {
+                    $sid = $_.siteId
+                    $hid = $_.hostId
+                    # Match by exact siteId; hostId in the filter is the base part before ':'
+                    $baseHid = $hid -replace ':.+$', ''
+                    $matched = $false
+                    foreach ($fhid in $siteFilter.Keys) {
+                        $fbaseHid = $fhid -replace ':.+$', ''
+                        if ($fbaseHid -eq $baseHid -or $fhid -eq $hid) {
+                            if ($siteFilter[$fhid] -contains $sid) { $matched = $true; break }
+                        }
+                    }
+                    $matched
+                })
+                Write-Host "Proactive filter applied: monitoring $($sites.Count) of $before site(s) from variable '$DattoNetworksVarName'."
+            }
+        } elseif ($TestMode) {
+            # Show what filter would do in test mode (informational only — all sites still checked)
+            $testFilter = Get-ProactiveSiteFilter
+            if ($null -ne $testFilter) {
+                $wouldMonitor = @($sites | Where-Object {
+                    $sid     = $_.siteId
+                    $hid     = $_.hostId
+                    $baseHid = $hid -replace ':.+$', ''
+                    $matched = $false
+                    foreach ($fhid in $testFilter.Keys) {
+                        $fbaseHid = $fhid -replace ':.+$', ''
+                        if ($fbaseHid -eq $baseHid -or $fhid -eq $hid) {
+                            if ($testFilter[$fhid] -contains $sid) { $matched = $true; break }
+                        }
+                    }
+                    $matched
+                })
+                Write-Host "`n[TEST MODE] '$DattoNetworksVarName' variable is set — in production, only $($wouldMonitor.Count) of $($sites.Count) site(s) would be monitored."
+                foreach ($s in $wouldMonitor) {
+                    $lbl = if (-not [string]::IsNullOrWhiteSpace($s.meta.desc)) { $s.meta.desc } else { $s.meta.name }
+                    Write-Host "  -> $lbl (hostId=$($s.hostId)  siteId=$($s.siteId))"
+                }
+            }
+        }
+
+        $deviceMap   = Get-UniFiDevices      -Sites $sites -ApiKey $apiKey
+        $metricsMap  = Get-IspMetrics        -Sites $sites -ApiKey $apiKey
+        $healthMap   = Build-SiteHealthMap   -Hosts $hosts -Sites $sites -DeviceMap $deviceMap -MetricsMap $metricsMap
+        $rawAlerts   = Evaluate-Alerts       -HealthMap $healthMap
+        $finalAlerts = Merge-Alerts          -Alerts $rawAlerts
 
         if ($TestMode) {
             Write-TestOutput `
