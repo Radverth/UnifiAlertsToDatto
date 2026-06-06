@@ -204,8 +204,8 @@ function Get-UniFiDevices {
         $siteName = $site.meta.name
         $counts  = $site.statistics.counts
 
-        # Tier 1 — fast check using site counts
-        if ($UseTwoTierDeviceCheck -and $counts.offlineDevice -eq 0) {
+        # Tier 1 — fast check using site counts (treat null as 0 for sites with missing statistics)
+        if ($UseTwoTierDeviceCheck -and [int]($counts.offlineDevice) -eq 0) {
             if ($TestMode) {
                 Write-Host "  PASS (Tier 1) $siteName — 0 offline devices, skipping device call."
             }
@@ -217,9 +217,10 @@ function Get-UniFiDevices {
             Write-Host "  FETCH (Tier 2) $siteName — $($counts.offlineDevice) offline, fetching devices..."
         }
 
-        # Tier 2 — full per-site device call
+        # Tier 2 — full per-site device call (URL-encode hostId to handle colon in console IDs)
         try {
-            $devices = Get-AllPages -Uri "$BaseUrl/hosts/$hostId/sites/$siteId/devices" -ApiKey $ApiKey
+            $encodedHostId = [uri]::EscapeDataString($hostId)
+            $devices = Get-AllPages -Uri "$BaseUrl/hosts/$encodedHostId/sites/$siteId/devices" -ApiKey $ApiKey
             $deviceMap[$siteId] = $devices
 
             if ($TestMode) {
@@ -340,7 +341,7 @@ function Build-SiteHealthMap {
     foreach ($site in $Sites) {
         $siteId   = $site.siteId
         $hostId   = $site.hostId
-        $host     = $hostLookup[$hostId]
+        $hostRecord = $hostLookup[$hostId]
 
         $allDevices     = $DeviceMap[$siteId]
         $offlineDevices = @()
@@ -353,8 +354,8 @@ function Build-SiteHealthMap {
             SiteId          = $siteId
             SiteName        = $site.meta.name
             HostId          = $hostId
-            HostName        = $host.reportedState.name
-            HostConnected   = ($host.reportedState.state -eq 'connected')
+            HostName        = $hostRecord.reportedState.name
+            HostConnected   = ($hostRecord.reportedState.state -eq 'connected')
             SiteCounts      = $site.statistics.counts
             Devices         = $allDevices
             OfflineDevices  = $offlineDevices
