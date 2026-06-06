@@ -29,8 +29,8 @@ $ThresholdPacketLossCritPct  = 55
 $ThresholdAvgLatencyMs       = 100
 $ThresholdWanUptimeCritPct   = 99.0
 $ThresholdWanUptimeWarnPct   = 99.9
-$ThresholdTxRetryWarnPct     = 25    # TX retry rate — Warning
-$ThresholdTxRetryCritPct     = 40    # TX retry rate — Critical
+$ThresholdTxRetryWarnPct     = 50    # TX retry rate — Warning
+$ThresholdTxRetryCritPct     = 55    # TX retry rate — Critical
 
 # --- API Base URL ---
 $BaseUrl = 'https://api.ui.com/v1'
