@@ -460,13 +460,28 @@ SEVERITY:   Critical
 DETECTED:   $detectedAt
 ISSUE:      UniFi controller '$($site.HostName)' has lost cloud connectivity.
             All devices at this site may be unmanageable until connectivity is restored.
+            Users may also have lost internet access.
 
-REMEDIATION:
-  1. Check whether the site has an active internet connection.
-  2. Log into the UniFi console directly (if reachable on LAN) and check UniFi OS status.
-  3. Verify the controller has not been rebooted or had its network settings changed.
-  4. If the controller is a Cloud Key or UDM, check its power and physical connections.
-  5. If the site internet is down, escalate to ISP before working on the controller.
+BEFORE ACTING:
+  - Contact the customer to confirm whether they have internet access and if they
+    are aware of any disruption before attempting any remote or on-site intervention.
+  - Do not reboot or reconfigure anything without customer awareness — this may
+    cause additional downtime for active users.
+
+INVESTIGATION (remote):
+  1. Log into unifi.ui.com and check whether the controller appears online or offline.
+  2. If offline, check whether other sites on the same ISP are also affected
+     (may indicate a wider ISP outage rather than a site-specific issue).
+  3. Try pinging the site's WAN IP if known — if unreachable, the internet connection
+     is likely down rather than just the controller.
+
+RESOLUTION:
+  4. If the controller is online locally but not in cloud: ask the customer to reboot
+     the controller (power cycle) — advise this will briefly drop WiFi.
+  5. If the site internet is down: raise a fault with the ISP. Do not attempt on-site
+     work until internet is confirmed restored unless a physical visit is agreed.
+  6. If the controller remains offline after internet is confirmed up, a physical visit
+     may be required to inspect the device.
 "@
             }
         }
@@ -496,14 +511,29 @@ SITE:       $($site.SiteName)
 SEVERITY:   Critical
 DETECTED:   $detectedAt
 ISSUE:      $count UniFi device(s) offline$breakdownStr.
+            Note: detailed per-device information is unavailable for this site —
+            log into unifi.ui.com to identify the specific offline device(s).
 
-REMEDIATION:
-  1. Log into UniFi ($($site.HostName)) and identify the offline device(s).
-  2. Check physical power and ethernet connections on the affected device(s).
-  3. If a switch is offline, check upstream connectivity — APs on that switch will also appear offline.
-  4. If the gateway is offline, the site may have no internet — check WAN connection first.
-  5. Try a power cycle if the device is physically accessible.
-  6. If the device does not recover, check for hardware fault indicators (LEDs).
+BEFORE ACTING:
+  - Contact the customer to confirm the impact and whether they are aware.
+  - If a power cycle or physical intervention is needed, agree a convenient time
+    with the customer first — any action on a switch or gateway will cause downtime.
+
+INVESTIGATION (remote):
+  1. Log into unifi.ui.com, navigate to $($site.SiteName) and review the device list
+     to identify which device(s) are offline and for how long.
+  2. Check whether the gateway is among the offline devices — if so, the site may
+     have lost internet and users will be fully impacted.
+  3. If only APs are offline, check whether they share a common upstream switch
+     (a single offline PoE switch will take down all connected APs).
+
+RESOLUTION:
+  4. If the device is reachable via SSH or local management, attempt a remote reboot.
+  5. If a power cycle is needed and the device is on a managed PoE switch, this may
+     be possible remotely via unifi.ui.com — check before requesting a site visit.
+  6. If no remote options are available, arrange an on-site visit with the customer.
+  7. If the device does not recover after a power cycle, check UniFi for adoption
+     errors or firmware issues, and consider hardware replacement if the fault persists.
 "@
             }
         } else {
@@ -538,12 +568,28 @@ DEVICE:     $($d.name) ($deviceType)
 MODEL:      $($d.model)
 MAC:        $($d.mac)$gwNote
 
-REMEDIATION:
-  1. Check physical power and ethernet connections on $($d.name).
-  2. Verify upstream network connectivity (the switch port / uplink it connects to).
-  3. Try a power cycle if the device is physically accessible.
-  4. Log into UniFi ($($site.HostName)) to check for any adoption or config errors.
-  5. If the device does not recover after a power cycle, check for hardware fault indicators (LEDs).
+BEFORE ACTING:
+  - Contact the customer to confirm the impact and whether they are aware of the issue.
+  - Agree any power cycle or physical intervention with the customer before proceeding —
+    rebooting a switch or gateway will cause downtime for connected users and devices.
+
+INVESTIGATION (remote):
+  1. Log into unifi.ui.com, navigate to $($site.SiteName) and review $($d.name)'s status,
+     uptime history, and any alerts or adoption errors shown in UniFi.
+  2. Check how long the device has been offline — a recent drop may resolve itself
+     (e.g. firmware update reboot), whereas a persistent offline suggests a fault.
+  3. If this is a switch or AP, check whether upstream devices are healthy — an offline
+     uplink or PoE switch will take down all devices connected to it.
+
+RESOLUTION:
+  4. If the device is on a managed PoE switch, attempt a remote power cycle via
+     unifi.ui.com (Devices > select switch > Ports > toggle PoE on the affected port).
+  5. If the device supports it, attempt a remote reboot via unifi.ui.com
+     (Devices > select device > Settings > Restart).
+  6. If no remote power options are available, arrange an on-site visit with the
+     customer — bring a replacement unit in case of hardware failure.
+  7. On site: check physical connections, power indicators (LEDs), and re-adopt
+     the device in UniFi if it has lost its configuration.
 "@
                 }
             }
@@ -571,14 +617,29 @@ SITE:       $($site.SiteName)
 SEVERITY:   Critical
 DETECTED:   $detectedAt
 ISSUE:      Primary WAN uptime $wanUp%$ispStr.
-            Threshold: $ThresholdWanUptimeCritPct%. The WAN connection has been dropping.
-            Users are likely experiencing internet outages.
+            Threshold: $ThresholdWanUptimeCritPct%. The WAN connection has been dropping
+            repeatedly. Users are likely experiencing internet outages.
 
-REMEDIATION:
-  1. Check the ISP status page for reported outages$ispStr.
-  2. Reboot the ISP router/modem if accessible.
-  3. Log into the gateway and check the WAN interface for link drops or errors.
-  4. Raise a fault with the ISP if drops continue — reference the uptime percentage above.
+BEFORE ACTING:
+  - Contact the customer to confirm impact and whether they are aware.
+  - Do not reboot the gateway or ISP equipment without customer agreement —
+    this will cause a brief additional outage during the reboot.
+
+INVESTIGATION (remote):
+  1. Log into unifi.ui.com, navigate to $($site.SiteName) > Gateway > WAN and review
+     the uptime graph and event log to understand when drops are occurring and how long
+     they last (brief blips vs sustained outages suggest different root causes).
+  2. Check the ISP status page$ispStr for any reported incidents in the area.
+  3. If failover (WAN2) is configured and active, the site may still have internet —
+     confirm with the customer before escalating urgency.
+
+RESOLUTION:
+  4. If an ISP outage is confirmed, raise a fault with$ispStr and monitor for resolution.
+     Share the UniFi WAN uptime data with the ISP as evidence.
+  5. If no ISP outage is reported, ask the customer to power cycle the ISP
+     router/modem — advise this will cause a brief internet drop.
+  6. If drops persist after a modem reboot, escalate to the ISP with line quality
+     data and request an engineer visit or line test.
 "@
                     }
                 }
@@ -602,14 +663,32 @@ SEVERITY:   Critical
 DETECTED:   $detectedAt
 ISSUE:      TX retry rate $txRetry% (threshold: $ThresholdTxRetryCritPct%).
             High retry rates indicate significant RF interference, channel congestion,
-            or failing wireless hardware. Wireless clients will experience poor performance.
+            or failing wireless hardware. Wireless clients will experience slow speeds,
+            dropped connections, and poor reliability.
 
-REMEDIATION:
-  1. Log into UniFi ($($site.HostName)) and review the RF environment (channel utilisation).
-  2. Check for neighbouring networks on the same channel — adjust channel/width settings.
-  3. Look for physical obstructions or new interference sources near APs.
-  4. Check AP hardware — a failing radio can cause elevated retries.
-  5. Consider enabling auto-channel if not already active.
+BEFORE ACTING:
+  - Contact the customer to understand whether they have noticed wireless performance
+    issues and if anything has changed recently (new equipment, building works, etc).
+  - Any channel or RF changes made remotely will cause a brief WiFi disruption
+    while APs re-associate — agree timing with the customer before making changes.
+
+INVESTIGATION (remote):
+  1. Log into unifi.ui.com, navigate to $($site.SiteName) > Access Points and check
+     each AP's TX retry rate individually to identify whether one AP is the source
+     or whether the issue is site-wide.
+  2. Review the RF environment in UniFi (Insights > WiFi > Channel Utilisation) for
+     signs of channel congestion from neighbouring networks.
+  3. Check whether any APs have recently been added, moved, or updated — these
+     can temporarily affect RF performance.
+
+RESOLUTION:
+  4. If a single AP has an elevated retry rate, consider it may have a hardware fault
+     (failing radio). Monitor and arrange replacement if it does not improve.
+  5. If site-wide, adjust AP channel assignments to less congested channels via
+     unifi.ui.com — or enable auto-optimise (Settings > WiFi > Advanced).
+     Advise the customer of a brief WiFi disruption before applying.
+  6. If interference is suspected from physical sources (new microwave, cordless
+     phone, neighbouring office), switching to 5GHz-only for affected APs may help.
 "@
                     }
                 } elseif ($txRetry -gt $ThresholdTxRetryWarnPct) {
@@ -627,12 +706,17 @@ SEVERITY:   Warning
 DETECTED:   $detectedAt
 ISSUE:      TX retry rate $txRetry% (threshold: $ThresholdTxRetryWarnPct%).
             Elevated retries may indicate RF interference or channel congestion.
-            Wireless performance may be degraded.
+            Wireless performance may be degraded for some users.
 
-REMEDIATION:
-  1. Monitor — if retry rate exceeds $ThresholdTxRetryCritPct%, escalate to Critical.
-  2. Log into UniFi ($($site.HostName)) and review the RF environment.
-  3. Check for neighbouring networks on the same channel.
+INVESTIGATION (remote — no customer contact required at this stage):
+  1. Log into unifi.ui.com, navigate to $($site.SiteName) > Access Points and check
+     which APs have elevated retry rates to determine if this is isolated or site-wide.
+  2. Review channel utilisation in UniFi (Insights > WiFi) for signs of congestion.
+  3. Monitor over the next few poll cycles — if the rate rises above $ThresholdTxRetryCritPct%,
+     escalate to Critical and contact the customer.
+
+NOTE: Do not make any channel or RF changes without first contacting the customer,
+as this will cause a brief WiFi disruption while APs re-associate.
 "@
                     }
                 }
