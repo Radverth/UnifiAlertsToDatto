@@ -55,7 +55,8 @@ function Invoke-UniFiApi {
         [string] $Method = 'GET',
         [string] $Uri,
         [object] $Body = $null,
-        [string] $ApiKey
+        [string] $ApiKey,
+        [switch] $Raw   # Return full response envelope instead of just .data
     )
 
     $headers = @{
@@ -79,16 +80,20 @@ function Invoke-UniFiApi {
     while ($attempt -lt 2) {
         try {
             $response = Invoke-RestMethod @params
-            return $response.data
-        } catch [System.Net.WebException] {
-            $statusCode = [int]$_.Exception.Response.StatusCode
+            if ($Raw) { return $response } else { return $response.data }
+        } catch {
+            # Resolve HTTP status code — works on both WinPS 5.1 (WebException) and PS 7+ (HttpResponseException)
+            $statusCode = 0
+            if ($_.Exception.Response -ne $null) {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            } elseif ($_.Exception -is [System.Net.Http.HttpRequestException] -and $_.Exception.StatusCode) {
+                $statusCode = [int]$_.Exception.StatusCode
+            }
 
             if ($statusCode -eq 429) {
                 if ($attempt -eq 0) {
                     $retryAfter = 60
-                    try {
-                        $retryAfter = [int]$_.Exception.Response.Headers['Retry-After']
-                    } catch {}
+                    try { $retryAfter = [int]$_.Exception.Response.Headers['Retry-After'] } catch {}
                     Write-Host "Rate limit hit. Sleeping $retryAfter seconds before retry."
                     Start-Sleep -Seconds $retryAfter
                     $attempt++
@@ -106,16 +111,20 @@ function Invoke-UniFiApi {
                 return $null
             }
 
-            # Attempt to read traceId from response body
+            # Attempt to extract traceId from response body
             $traceId = ''
             try {
-                $reader   = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $stream   = $_.Exception.Response.GetResponseStream()
+                $reader   = New-Object System.IO.StreamReader($stream)
                 $bodyText = $reader.ReadToEnd()
-                $parsed   = $bodyText | ConvertFrom-Json
-                $traceId  = $parsed.traceId
+                $traceId  = ($bodyText | ConvertFrom-Json).traceId
             } catch {}
 
-            throw "HTTP $statusCode from $Uri (traceId: $traceId): $($_.Exception.Message)"
+            if ($statusCode -gt 0) {
+                throw "HTTP $statusCode from $Uri (traceId: $traceId): $($_.Exception.Message)"
+            } else {
+                throw "Request failed for $Uri : $($_.Exception.Message)"
+            }
         }
     }
 }
@@ -134,13 +143,8 @@ function Get-AllPages {
         $pageUri   = "$Uri${separator}pageSize=200"
         if ($nextToken) { $pageUri += "&nextToken=$nextToken" }
 
-        $page      = Invoke-UniFiApi -Uri $pageUri -ApiKey $ApiKey
-        if ($page) { $results += $page }
-
-        # nextToken lives at the response envelope level, not in .data
-        # Re-invoke raw to get the token
-        $headers = @{ 'X-API-Key' = $ApiKey; 'Accept' = 'application/json' }
-        $raw     = Invoke-RestMethod -Method GET -Uri $pageUri -Headers $headers -ErrorAction Stop
+        $raw = Invoke-UniFiApi -Uri $pageUri -ApiKey $ApiKey -Raw
+        if ($raw.data) { $results += $raw.data }
         $nextToken = $raw.nextToken
     } while (-not [string]::IsNullOrWhiteSpace($nextToken))
 
