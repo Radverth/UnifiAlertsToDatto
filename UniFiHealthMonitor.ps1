@@ -860,54 +860,27 @@ function Main {
         $hosts  = Get-UniFiHosts -ApiKey $apiKey
         $sites  = Get-UniFiSites -ApiKey $apiKey -Hosts $hosts
 
-        # --- Proactive customer filtering (production mode only) ---
-        # When $TestMode = $false, read the Datto site variable $DattoNetworksVarName
-        # (e.g. "UniFiNetworks" = "HostID|SiteID,HostID2|SiteID2,...") and restrict
-        # monitoring to only the listed host/site pairs for this customer.
-        $siteFilter = $null
-        if (-not $TestMode) {
-            $siteFilter = Get-ProactiveSiteFilter
-            if ($null -ne $siteFilter) {
-                $before = $sites.Count
-                $sites  = @($sites | Where-Object {
-                    $sid = $_.siteId
-                    $hid = $_.hostId
-                    # Match by exact siteId; hostId in the filter is the base part before ':'
-                    $baseHid = $hid -replace ':.+$', ''
-                    $matched = $false
-                    foreach ($fhid in $siteFilter.Keys) {
-                        $fbaseHid = $fhid -replace ':.+$', ''
-                        if ($fbaseHid -eq $baseHid -or $fhid -eq $hid) {
-                            if ($siteFilter[$fhid] -contains $sid) { $matched = $true; break }
-                        }
+        # --- Proactive customer filtering ---
+        # When $DattoNetworksVarName is set (e.g. "HostID|SiteID,HostID2|SiteID2,..."),
+        # restrict monitoring to only those host/site pairs. Applies in both test and
+        # production mode so you can test a specific customer's scope.
+        $siteFilter = Get-ProactiveSiteFilter
+        if ($null -ne $siteFilter) {
+            $before = $sites.Count
+            $sites  = @($sites | Where-Object {
+                $sid     = $_.siteId
+                $hid     = $_.hostId
+                $baseHid = $hid -replace ':.+$', ''
+                $matched = $false
+                foreach ($fhid in $siteFilter.Keys) {
+                    $fbaseHid = $fhid -replace ':.+$', ''
+                    if ($fbaseHid -eq $baseHid -or $fhid -eq $hid) {
+                        if ($siteFilter[$fhid] -contains $sid) { $matched = $true; break }
                     }
-                    $matched
-                })
-                Write-Host "Proactive filter applied: monitoring $($sites.Count) of $before site(s) from variable '$DattoNetworksVarName'."
-            }
-        } elseif ($TestMode) {
-            # Show what filter would do in test mode (informational only — all sites still checked)
-            $testFilter = Get-ProactiveSiteFilter
-            if ($null -ne $testFilter) {
-                $wouldMonitor = @($sites | Where-Object {
-                    $sid     = $_.siteId
-                    $hid     = $_.hostId
-                    $baseHid = $hid -replace ':.+$', ''
-                    $matched = $false
-                    foreach ($fhid in $testFilter.Keys) {
-                        $fbaseHid = $fhid -replace ':.+$', ''
-                        if ($fbaseHid -eq $baseHid -or $fhid -eq $hid) {
-                            if ($testFilter[$fhid] -contains $sid) { $matched = $true; break }
-                        }
-                    }
-                    $matched
-                })
-                Write-Host "`n[TEST MODE] '$DattoNetworksVarName' variable is set — in production, only $($wouldMonitor.Count) of $($sites.Count) site(s) would be monitored."
-                foreach ($s in $wouldMonitor) {
-                    $lbl = if (-not [string]::IsNullOrWhiteSpace($s.meta.desc)) { $s.meta.desc } else { $s.meta.name }
-                    Write-Host "  -> $lbl (hostId=$($s.hostId)  siteId=$($s.siteId))"
                 }
-            }
+                $matched
+            })
+            Write-Host "Filter applied ($DattoNetworksVarName): monitoring $($sites.Count) of $before site(s)."
         }
 
         $deviceMap   = Get-UniFiDevices      -Sites $sites -Hosts $hosts -ApiKey $apiKey
