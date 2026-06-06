@@ -174,15 +174,30 @@ function Get-UniFiHosts {
 }
 
 function Get-UniFiSites {
-    param([string] $ApiKey)
+    param(
+        [string] $ApiKey,
+        [array]  $Hosts
+    )
 
     $sites = Get-AllPages -Uri "$BaseUrl/sites" -ApiKey $ApiKey
 
     if ($TestMode) {
+        # Build lookups needed for display name resolution
+        $hostLookup    = @{}; foreach ($h in $Hosts) { $hostLookup[$h.id] = $h }
+        $hostSiteCount = @{}; foreach ($s in $sites) { $hostSiteCount[$s.hostId] = ($hostSiteCount[$s.hostId] + 1) }
+
         Write-Host "`n=== SITES ($($sites.Count)) ==="
         foreach ($s in $sites) {
-            $counts    = $s.statistics.counts
-            $label     = if (-not [string]::IsNullOrWhiteSpace($s.meta.desc)) { $s.meta.desc } else { $s.meta.name }
+            $counts   = $s.statistics.counts
+            $siteName = if (-not [string]::IsNullOrWhiteSpace($s.meta.desc)) { $s.meta.desc } else { $s.meta.name }
+            $hostName = $hostLookup[$s.hostId].reportedState.name
+            $label    = if ($siteName -ne 'default') {
+                $siteName
+            } elseif ($hostSiteCount[$s.hostId] -eq 1) {
+                $hostName
+            } else {
+                "$hostName (unnamed site)"
+            }
             Write-Host ("  [{0}]  hostId={1}  total={2}  offline={3}  gw_offline={4}" -f
                 $label, $s.hostId,
                 $counts.totalDevice, $counts.offlineDevice, $counts.offlineGatewayDevice)
@@ -195,6 +210,7 @@ function Get-UniFiSites {
 function Get-UniFiDevices {
     param(
         [array]  $Sites,
+        [array]  $Hosts,
         [string] $ApiKey
     )
 
@@ -218,6 +234,9 @@ function Get-UniFiDevices {
         }
     }
 
+    # Build host lookup for display name resolution in test output
+    $hostLookup    = @{}; foreach ($h in $Hosts) { $hostLookup[$h.id] = $h }
+
     if ($TestMode) {
         Write-Host "`n=== DEVICE CHECK ==="
     }
@@ -225,8 +244,18 @@ function Get-UniFiDevices {
     foreach ($site in $Sites) {
         $siteId   = $site.siteId
         $hostId   = $site.hostId
-        $siteName = $site.meta.name
         $counts   = $site.statistics.counts
+
+        # Resolve display name (same logic as Build-SiteHealthMap)
+        $siteMeta = if (-not [string]::IsNullOrWhiteSpace($site.meta.desc)) { $site.meta.desc } else { $site.meta.name }
+        $hostName = $hostLookup[$hostId].reportedState.name
+        $siteName = if ($siteMeta -ne 'default') {
+            $siteMeta
+        } elseif ($hostSiteCount[$hostId] -eq 1) {
+            $hostName
+        } else {
+            "$hostName (unnamed site)"
+        }
 
         # Tier 1 — fast check using site counts (treat null as 0 for sites with missing statistics)
         if ($UseTwoTierDeviceCheck -and [int]($counts.offlineDevice) -eq 0) {
@@ -552,28 +581,6 @@ REMEDIATION:
   4. Raise a fault with the ISP if drops continue — reference the uptime percentage above.
 "@
                     }
-                } elseif ($wanUp -lt $ThresholdWanUptimeWarnPct) {
-                    $alerts += [PSCustomObject]@{
-                        SiteId      = $siteId
-                        SiteName    = $site.SiteName
-                        Severity    = 'Warning'
-                        Category    = 'WANUptime'
-                        DeviceName  = ''
-                        DeviceMac   = ''
-                        DeviceModel = ''
-                        Detail      = @"
-SITE:       $($site.SiteName)
-SEVERITY:   Warning
-DETECTED:   $detectedAt
-ISSUE:      Primary WAN uptime $wanUp%$ispStr.
-            Threshold: $ThresholdWanUptimeWarnPct%. The WAN link has experienced brief drops.
-
-REMEDIATION:
-  1. Monitor — if uptime drops below $ThresholdWanUptimeCritPct%, escalate to Critical.
-  2. Check the ISP status page for reported issues$ispStr.
-  3. Log into the gateway and review WAN interface event logs.
-"@
-                    }
                 }
             }
 
@@ -851,7 +858,7 @@ function Main {
     try {
         $apiKey = Get-UniFiApiKey
         $hosts  = Get-UniFiHosts -ApiKey $apiKey
-        $sites  = Get-UniFiSites -ApiKey $apiKey
+        $sites  = Get-UniFiSites -ApiKey $apiKey -Hosts $hosts
 
         # --- Proactive customer filtering (production mode only) ---
         # When $TestMode = $false, read the Datto site variable $DattoNetworksVarName
@@ -903,7 +910,7 @@ function Main {
             }
         }
 
-        $deviceMap   = Get-UniFiDevices      -Sites $sites -ApiKey $apiKey
+        $deviceMap   = Get-UniFiDevices      -Sites $sites -Hosts $hosts -ApiKey $apiKey
         $metricsMap  = Get-SiteWanMetrics    -Sites $sites
         $healthMap   = Build-SiteHealthMap   -Hosts $hosts -Sites $sites -DeviceMap $deviceMap -MetricsMap $metricsMap
         $rawAlerts   = Evaluate-Alerts       -HealthMap $healthMap
