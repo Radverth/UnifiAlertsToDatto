@@ -217,10 +217,9 @@ function Get-UniFiDevices {
             Write-Host "  FETCH (Tier 2) $siteName — $($counts.offlineDevice) offline, fetching devices..."
         }
 
-        # Tier 2 — full per-site device call (URL-encode hostId to handle colon in console IDs)
+        # Tier 2 — full per-site device call
         try {
-            $encodedHostId = [uri]::EscapeDataString($hostId)
-            $devices = Get-AllPages -Uri "$BaseUrl/hosts/$encodedHostId/sites/$siteId/devices" -ApiKey $ApiKey
+            $devices = Get-AllPages -Uri "$BaseUrl/sites/$siteId/devices" -ApiKey $ApiKey
             $deviceMap[$siteId] = $devices
 
             if ($TestMode) {
@@ -350,11 +349,21 @@ function Build-SiteHealthMap {
             $offlineDevices = @($allDevices | Where-Object { $_.status -ne 'online' })
         }
 
+        $hostName  = $hostRecord.reportedState.name
+        $siteName  = $site.meta.name
+        # Use controller name as display name when site name is generic,
+        # or append site name when a controller hosts multiple named sites
+        $displayName = if ($siteName -eq 'default') {
+            $hostName
+        } else {
+            "$hostName — $siteName"
+        }
+
         $healthMap[$siteId] = @{
             SiteId          = $siteId
-            SiteName        = $site.meta.name
+            SiteName        = $displayName
             HostId          = $hostId
-            HostName        = $hostRecord.reportedState.name
+            HostName        = $hostName
             HostConnected   = ($hostRecord.reportedState.state -eq 'connected')
             SiteCounts      = $site.statistics.counts
             Devices         = $allDevices
