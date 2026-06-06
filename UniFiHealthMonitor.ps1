@@ -397,6 +397,8 @@ function Evaluate-Alerts {
     foreach ($siteId in $HealthMap.Keys) {
         $site = $HealthMap[$siteId]
 
+        $detectedAt = (Get-Date).ToString('dd/MM/yyyy HH:mm')
+
         # Host / Controller Disconnected
         if (-not $site.HostConnected) {
             $alerts += [PSCustomObject]@{
@@ -407,13 +409,35 @@ function Evaluate-Alerts {
                 DeviceName  = $site.HostName
                 DeviceMac   = ''
                 DeviceModel = ''
-                Detail      = "Controller '$($site.HostName)' lost cloud connectivity."
+                Detail      = @"
+SITE:       $($site.SiteName)
+SEVERITY:   Critical
+DETECTED:   $detectedAt
+ISSUE:      UniFi controller '$($site.HostName)' has lost cloud connectivity.
+            All devices at this site may be unmanageable until connectivity is restored.
+
+REMEDIATION:
+  1. Check whether the site has an active internet connection.
+  2. Log into the UniFi console directly (if reachable on LAN) and check UniFi OS status.
+  3. Verify the controller has not been rebooted or had its network settings changed.
+  4. If the controller is a Cloud Key or UDM, check its power and physical connections.
+  5. If the site internet is down, escalate to ISP before working on the controller.
+"@
             }
         }
 
         # Offline Devices
         if ($site.DeviceFetchError) {
             $count = $site.SiteCounts.offlineDevice
+            $gwOffline = [int]$site.SiteCounts.offlineGatewayDevice
+            $apOffline = [int]$site.SiteCounts.offlineWifiDevice
+            $swOffline = [int]$site.SiteCounts.offlineWiredDevice
+            $breakdown = @()
+            if ($gwOffline -gt 0) { $breakdown += "$gwOffline gateway" }
+            if ($apOffline -gt 0) { $breakdown += "$apOffline access point(s)" }
+            if ($swOffline -gt 0) { $breakdown += "$swOffline switch(es)" }
+            $breakdownStr = if ($breakdown.Count -gt 0) { " ($($breakdown -join ', '))" } else { '' }
+
             $alerts += [PSCustomObject]@{
                 SiteId      = $siteId
                 SiteName    = $site.SiteName
@@ -422,10 +446,37 @@ function Evaluate-Alerts {
                 DeviceName  = ''
                 DeviceMac   = ''
                 DeviceModel = ''
-                Detail      = "$count device(s) offline at $($site.SiteName) (detail unavailable — device fetch failed)."
+                Detail      = @"
+SITE:       $($site.SiteName)
+SEVERITY:   Critical
+DETECTED:   $detectedAt
+ISSUE:      $count UniFi device(s) offline$breakdownStr.
+
+REMEDIATION:
+  1. Log into UniFi ($($site.HostName)) and identify the offline device(s).
+  2. Check physical power and ethernet connections on the affected device(s).
+  3. If a switch is offline, check upstream connectivity — APs on that switch will also appear offline.
+  4. If the gateway is offline, the site may have no internet — check WAN connection first.
+  5. Try a power cycle if the device is physically accessible.
+  6. If the device does not recover, check for hardware fault indicators (LEDs).
+"@
             }
         } else {
             foreach ($d in $site.OfflineDevices) {
+                $deviceType = switch -Wildcard ($d.model) {
+                    'USW*'   { 'Switch' }
+                    'UAP*'   { 'Access Point' }
+                    'U6*'    { 'Access Point' }
+                    'UDM*'   { 'Gateway / Dream Machine' }
+                    'UDR*'   { 'Gateway / Dream Router' }
+                    'USG*'   { 'Gateway' }
+                    'UXG*'   { 'Gateway' }
+                    default  { 'UniFi Device' }
+                }
+                $gwNote = if ($d.isConsole -or $deviceType -like '*Gateway*') {
+                    "`n            NOTE: This is the site gateway — the site may have no internet connectivity."
+                } else { '' }
+
                 $alerts += [PSCustomObject]@{
                     SiteId      = $siteId
                     SiteName    = $site.SiteName
@@ -434,7 +485,21 @@ function Evaluate-Alerts {
                     DeviceName  = $d.name
                     DeviceMac   = $d.mac
                     DeviceModel = $d.model
-                    Detail      = "$($d.model) '$($d.name)' ($($d.mac)) is offline."
+                    Detail      = @"
+SITE:       $($site.SiteName)
+SEVERITY:   Critical
+DETECTED:   $detectedAt
+DEVICE:     $($d.name) ($deviceType)
+MODEL:      $($d.model)
+MAC:        $($d.mac)$gwNote
+
+REMEDIATION:
+  1. Check physical power and ethernet connections on $($d.name).
+  2. Verify upstream network connectivity (the switch port / uplink it connects to).
+  3. Try a power cycle if the device is physically accessible.
+  4. Log into UniFi ($($site.HostName)) to check for any adoption or config errors.
+  5. If the device does not recover after a power cycle, check for hardware fault indicators (LEDs).
+"@
                 }
             }
         }
@@ -442,6 +507,8 @@ function Evaluate-Alerts {
         # ISP / WAN Metrics
         $wan = $site.WanMetrics
         if ($wan) {
+            $ispStr = if ($wan.IspName) { " via $($wan.IspName)" } else { '' }
+
             # Packet Loss
             if ($wan.PacketLoss -gt $ThresholdPacketLossCritPct) {
                 $alerts += [PSCustomObject]@{
@@ -452,7 +519,20 @@ function Evaluate-Alerts {
                     DeviceName  = ''
                     DeviceMac   = ''
                     DeviceModel = ''
-                    Detail      = "WAN packet loss $($wan.PacketLoss)% (threshold: $ThresholdPacketLossCritPct%)."
+                    Detail      = @"
+SITE:       $($site.SiteName)
+SEVERITY:   Critical
+DETECTED:   $detectedAt
+ISSUE:      WAN packet loss $($wan.PacketLoss)%$ispStr (threshold: $ThresholdPacketLossCritPct%).
+            Measured over the last $IspMetricsWindowMinutes minutes. Users are likely experiencing
+            significant connectivity problems.
+
+REMEDIATION:
+  1. Check the ISP status page for reported outages$ispStr.
+  2. Log into the gateway and check the WAN interface for errors or flapping.
+  3. Reboot the ISP router/modem if accessible.
+  4. If persistent, raise a fault with the ISP.
+"@
                 }
             } elseif ($wan.PacketLoss -gt $ThresholdPacketLossWarnPct) {
                 $alerts += [PSCustomObject]@{
@@ -463,7 +543,20 @@ function Evaluate-Alerts {
                     DeviceName  = ''
                     DeviceMac   = ''
                     DeviceModel = ''
-                    Detail      = "WAN packet loss $($wan.PacketLoss)% (threshold: $ThresholdPacketLossWarnPct%)."
+                    Detail      = @"
+SITE:       $($site.SiteName)
+SEVERITY:   Warning
+DETECTED:   $detectedAt
+ISSUE:      WAN packet loss $($wan.PacketLoss)%$ispStr (threshold: $ThresholdPacketLossWarnPct%).
+            Measured over the last $IspMetricsWindowMinutes minutes. Users may notice intermittent
+            connectivity issues.
+
+REMEDIATION:
+  1. Monitor — if loss increases above $ThresholdPacketLossCritPct%, escalate to Critical.
+  2. Check the ISP status page for reported issues$ispStr.
+  3. Log into the gateway and check the WAN interface for errors.
+  4. If persistent over the next poll cycle, raise a fault with the ISP.
+"@
                 }
             }
 
@@ -477,7 +570,20 @@ function Evaluate-Alerts {
                     DeviceName  = ''
                     DeviceMac   = ''
                     DeviceModel = ''
-                    Detail      = "WAN avg latency $($wan.AvgLatency)ms (threshold: $($ThresholdAvgLatencyMs)ms)."
+                    Detail      = @"
+SITE:       $($site.SiteName)
+SEVERITY:   Warning
+DETECTED:   $detectedAt
+ISSUE:      WAN average latency $($wan.AvgLatency)ms (peak $($wan.MaxLatency)ms)$ispStr.
+            Threshold: $($ThresholdAvgLatencyMs)ms. Measured over the last $IspMetricsWindowMinutes minutes.
+            Users may experience slow page loads, laggy video calls, or VoIP quality issues.
+
+REMEDIATION:
+  1. Check the ISP status page for reported issues$ispStr.
+  2. Check for bandwidth saturation — high throughput can inflate latency.
+  3. Log into the gateway and review WAN interface statistics.
+  4. If persistent, raise a fault with the ISP referencing the latency figures above.
+"@
                 }
             }
 
@@ -491,7 +597,20 @@ function Evaluate-Alerts {
                     DeviceName  = ''
                     DeviceMac   = ''
                     DeviceModel = ''
-                    Detail      = "WAN uptime $($wan.UptimePct)% in last $IspMetricsWindowMinutes min (threshold: $ThresholdWanUptimeCritPct%)."
+                    Detail      = @"
+SITE:       $($site.SiteName)
+SEVERITY:   Critical
+DETECTED:   $detectedAt
+ISSUE:      WAN uptime $($wan.UptimePct)%$ispStr in the last $IspMetricsWindowMinutes minutes.
+            Threshold: $ThresholdWanUptimeCritPct%. The WAN connection has been dropping repeatedly.
+            Users are likely experiencing internet outages.
+
+REMEDIATION:
+  1. Check the ISP status page for reported outages$ispStr.
+  2. Reboot the ISP router/modem if accessible.
+  3. Log into the gateway and check the WAN interface for link drops or errors.
+  4. Raise a fault with the ISP if drops continue — reference the uptime percentage above.
+"@
                 }
             } elseif ($wan.UptimePct -lt $ThresholdWanUptimeWarnPct) {
                 $alerts += [PSCustomObject]@{
@@ -502,7 +621,18 @@ function Evaluate-Alerts {
                     DeviceName  = ''
                     DeviceMac   = ''
                     DeviceModel = ''
-                    Detail      = "WAN uptime $($wan.UptimePct)% in last $IspMetricsWindowMinutes min (threshold: $ThresholdWanUptimeWarnPct%)."
+                    Detail      = @"
+SITE:       $($site.SiteName)
+SEVERITY:   Warning
+DETECTED:   $detectedAt
+ISSUE:      WAN uptime $($wan.UptimePct)%$ispStr in the last $IspMetricsWindowMinutes minutes.
+            Threshold: $ThresholdWanUptimeWarnPct%. The WAN link has experienced brief drops.
+
+REMEDIATION:
+  1. Monitor — if uptime drops below $ThresholdWanUptimeCritPct%, escalate to Critical.
+  2. Check the ISP status page for reported issues$ispStr.
+  3. Log into the gateway and review WAN interface event logs.
+"@
                 }
             }
         }
@@ -527,7 +657,7 @@ function Merge-Alerts {
         # Highest severity: Critical > Warning
         $severity = if ($items | Where-Object { $_.Severity -eq 'Critical' }) { 'Critical' } else { 'Warning' }
 
-        $details  = ($items | ForEach-Object { $_.Detail }) -join ' | '
+        $details  = ($items | ForEach-Object { $_.Detail }) -join "`n$('=' * 60)`n"
 
         $merged += [PSCustomObject]@{
             SiteId      = $siteId
@@ -552,12 +682,17 @@ function Write-DattoOutput {
     if ($Alerts.Count -eq 0) {
         Write-Host 'All monitored UniFi sites are healthy.'
     } else {
-        foreach ($a in $Alerts) {
-            Write-Host "[$($a.Severity)] $($a.SiteName): $($a.Detail)"
-        }
         $critCount = ($Alerts | Where-Object { $_.Severity -eq 'Critical' }).Count
         $warnCount = ($Alerts | Where-Object { $_.Severity -eq 'Warning' }).Count
-        Write-Host "Summary: $($Alerts.Count) alert(s) — $critCount Critical, $warnCount Warning."
+        Write-Host "UniFi Health Monitor — $($Alerts.Count) alert(s) detected: $critCount Critical, $warnCount Warning"
+        Write-Host "Generated: $((Get-Date).ToString('dd/MM/yyyy HH:mm')) UTC"
+        Write-Host ""
+        $sep = '=' * 60
+        foreach ($a in $Alerts) {
+            Write-Host $sep
+            Write-Host $a.Detail
+        }
+        Write-Host $sep
     }
 
     Write-Host '<-End Diagnostic->'
@@ -604,7 +739,8 @@ function Write-TestOutput {
         $sitesOnHost = @($Sites | Where-Object { $_.hostId -eq $h.id })
         Write-Host "  Controller: $($h.reportedState.name) [$($h.reportedState.state)] — $($sitesOnHost.Count) site(s)"
         foreach ($s in $sitesOnHost) {
-            Write-Host "    -> $($s.meta.name) (siteId=$($s.siteId))"
+            $label = if (-not [string]::IsNullOrWhiteSpace($s.meta.desc)) { $s.meta.desc } else { $s.meta.name }
+            Write-Host "    -> $label (siteId=$($s.siteId))"
         }
     }
 
@@ -654,16 +790,19 @@ function Write-TestOutput {
         Write-Host "  No alerts."
     }
     foreach ($a in $RawAlerts) {
-        Write-Host "  [$($a.Severity)] $($a.Category) @ $($a.SiteName): $($a.Detail)"
+        Write-Host "  [$($a.Severity)] $($a.Category) @ $($a.SiteName)"
     }
 
-    Write-Host "`n--- Section 8: Final Alerts After Merge ---"
+    $sep = '=' * 60
+    Write-Host "`n--- Section 8: Final Alerts (ticket preview) ---"
     if ($FinalAlerts.Count -eq 0) {
         Write-Host "  No alerts."
     }
     foreach ($a in $FinalAlerts) {
-        Write-Host "  [$($a.Severity)] $($a.SiteName): $($a.Detail)"
+        Write-Host $sep
+        Write-Host $a.Detail
     }
+    if ($FinalAlerts.Count -gt 0) { Write-Host $sep }
 
     Write-Host "`n--- Section 9: Datto Status Line (preview) ---"
     if ($FinalAlerts.Count -eq 0) {
