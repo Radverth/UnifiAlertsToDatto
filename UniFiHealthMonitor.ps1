@@ -218,18 +218,35 @@ function Get-UniFiDevices {
             Write-Host "  FETCH (Tier 2) $siteName — $($counts.offlineDevice) offline, fetching devices..."
         }
 
-        # Tier 2 — full per-site device call
-        try {
-            $devices = Get-AllPages -Uri "$BaseUrl/sites/$siteId/devices" -ApiKey $ApiKey
-            $deviceMap[$siteId] = $devices
+        # Tier 2 — per-site device call, trying multiple endpoint forms
+        $devices = $null
+        $baseHostId = $hostId -replace ':.+$', ''   # strip :port suffix
 
+        $endpointsToTry = @(
+            "$BaseUrl/hosts/$baseHostId/sites/$siteId/devices",
+            "$BaseUrl/hosts/$hostId/sites/$siteId/devices",
+            "$BaseUrl/sites/$siteId/devices"
+        )
+
+        foreach ($endpoint in $endpointsToTry) {
+            try {
+                $devices = Get-AllPages -Uri $endpoint -ApiKey $ApiKey
+                if ($TestMode) { Write-Host "    OK: $endpoint" }
+                break
+            } catch {
+                if ($TestMode) { Write-Host "    FAIL ($([int]$_.Exception.Response.StatusCode)): $endpoint" }
+            }
+        }
+
+        if ($null -ne $devices) {
+            $deviceMap[$siteId] = $devices
             if ($TestMode) {
                 foreach ($d in $devices) {
                     Write-Host ("    [{0}] {1} ({2}) mac={3}" -f $d.status, $d.name, $d.model, $d.mac)
                 }
             }
-        } catch {
-            Write-Host "  WARNING: Failed to fetch devices for site '$siteName': $_"
+        } else {
+            Write-Host "  WARNING: All device endpoints returned 404 for site '$siteName' — using Tier 1 count only."
             $deviceMap[$siteId] = 'ERROR'
         }
     }
