@@ -139,7 +139,7 @@ function Get-AllPages {
     $nextToken = $null
 
     do {
-        $separator = if ($Uri -like '*?*') { '&' } else { '?' }
+        $separator = if ($Uri.Contains('?')) { '&' } else { '?' }
         $pageUri   = "$Uri${separator}pageSize=200"
         if ($nextToken) { $pageUri += "&nextToken=$nextToken" }
 
