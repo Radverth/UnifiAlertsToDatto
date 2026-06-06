@@ -456,6 +456,7 @@ function Evaluate-Alerts {
                 DeviceModel = ''
                 Detail      = @"
 SITE:       $($site.SiteName)
+SITE ID:    $siteId
 SEVERITY:   Critical
 DETECTED:   $detectedAt
 ISSUE:      UniFi controller '$($site.HostName)' has lost cloud connectivity.
@@ -508,6 +509,7 @@ RESOLUTION:
                 DeviceModel = ''
                 Detail      = @"
 SITE:       $($site.SiteName)
+SITE ID:    $siteId
 SEVERITY:   Critical
 DETECTED:   $detectedAt
 ISSUE:      $count UniFi device(s) offline$breakdownStr.
@@ -562,6 +564,7 @@ RESOLUTION:
                     DeviceModel = $d.model
                     Detail      = @"
 SITE:       $($site.SiteName)
+SITE ID:    $siteId
 SEVERITY:   Critical
 DETECTED:   $detectedAt
 DEVICE:     $($d.name) ($deviceType)
@@ -614,6 +617,7 @@ RESOLUTION:
                         DeviceModel = ''
                         Detail      = @"
 SITE:       $($site.SiteName)
+SITE ID:    $siteId
 SEVERITY:   Critical
 DETECTED:   $detectedAt
 ISSUE:      Primary WAN uptime $wanUp%$ispStr.
@@ -659,6 +663,7 @@ RESOLUTION:
                         DeviceModel = ''
                         Detail      = @"
 SITE:       $($site.SiteName)
+SITE ID:    $siteId
 SEVERITY:   Critical
 DETECTED:   $detectedAt
 ISSUE:      TX retry rate $txRetry% (threshold: $ThresholdTxRetryCritPct%).
@@ -702,6 +707,7 @@ RESOLUTION:
                         DeviceModel = ''
                         Detail      = @"
 SITE:       $($site.SiteName)
+SITE ID:    $siteId
 SEVERITY:   Warning
 DETECTED:   $detectedAt
 ISSUE:      TX retry rate $txRetry% (threshold: $ThresholdTxRetryWarnPct%).
