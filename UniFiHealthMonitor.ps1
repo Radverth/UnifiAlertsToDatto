@@ -197,14 +197,11 @@ function Get-UniFiSites {
         [hashtable] $SiteFilter = $null
     )
 
-    # If a filter is set, scope the API request to only the relevant host IDs.
-    # This avoids fetching sites for controllers the customer doesn't own.
-    if ($null -ne $SiteFilter -and $SiteFilter.Count -gt 0) {
-        $hostIdParams = ($Hosts | ForEach-Object { "hostIds[]=$([Uri]::EscapeDataString($_.id))" }) -join '&'
-        $uri          = "$BaseUrl/sites?$hostIdParams"
-        $sites        = Get-AllPages -Uri $uri -ApiKey $ApiKey
+    $sites = Get-AllPages -Uri "$BaseUrl/sites" -ApiKey $ApiKey
 
-        # Filter to the exact siteIds listed in the variable
+    # Filter to exact host/site pairs from the Datto variable (PowerShell-side only —
+    # the /v1/sites endpoint does not support hostIds query params).
+    if ($null -ne $SiteFilter -and $SiteFilter.Count -gt 0) {
         $filtered = @($sites | Where-Object {
             $sid     = $_.siteId
             $hid     = $_.hostId
@@ -218,15 +215,11 @@ function Get-UniFiSites {
             $matched
         })
 
-        # If the siteIds in the variable matched nothing (misconfigured), fall back to all
         if ($filtered.Count -eq 0) {
-            Write-Host "WARNING: $DattoNetworksVarName produced no matching sites — querying all sites as fallback."
-            $sites = Get-AllPages -Uri "$BaseUrl/sites" -ApiKey $ApiKey
+            Write-Host "WARNING: $DattoNetworksVarName produced no matching sites — monitoring all sites as fallback."
         } else {
             $sites = $filtered
         }
-    } else {
-        $sites = Get-AllPages -Uri "$BaseUrl/sites" -ApiKey $ApiKey
     }
 
     if ($TestMode) {
