@@ -369,8 +369,17 @@ function Build-SiteHealthMap {
 
         $hostName  = $hostRecord.reportedState.name
         $siteName  = if (-not [string]::IsNullOrWhiteSpace($site.meta.desc)) { $site.meta.desc } else { $site.meta.name }
-        # Use site desc/name directly; fall back to controller name only when site name is still generic
-        $displayName = if ($siteName -eq 'default') { $hostName } else { $siteName }
+        # For unnamed (default) sites on a dedicated controller, use the controller name.
+        # For unnamed sites on a shared controller, append "(unnamed site)" so it's clear
+        # it's a client site and not the controller itself.
+        $sitesOnThisHost = @($Sites | Where-Object { $_.hostId -eq $hostId })
+        $displayName = if ($siteName -ne 'default') {
+            $siteName
+        } elseif ($sitesOnThisHost.Count -eq 1) {
+            $hostName
+        } else {
+            "$hostName (unnamed site)"
+        }
 
         $healthMap[$siteId] = @{
             SiteId          = $siteId
@@ -746,28 +755,31 @@ function Write-TestOutput {
 
     Write-Host "`n--- Section 3: Tier 1 Site Counts ---"
     foreach ($s in $Sites) {
-        $c = $s.statistics.counts
-        Write-Host ("  {0,-30} total={1}  offline={2}  gw_offline={3}  ap_offline={4}  sw_offline={5}" -f
-            $s.meta.name, $c.totalDevice, $c.offlineDevice, $c.offlineGatewayDevice, $c.offlineWifiDevice, $c.offlineWiredDevice)
+        $c     = $s.statistics.counts
+        $label = if (-not [string]::IsNullOrWhiteSpace($s.meta.desc)) { $s.meta.desc } else { $s.meta.name }
+        Write-Host ("  {0,-35} total={1}  offline={2}  gw_offline={3}  ap_offline={4}  sw_offline={5}" -f
+            $label, $c.totalDevice, $c.offlineDevice, $c.offlineGatewayDevice, $c.offlineWifiDevice, $c.offlineWiredDevice)
     }
 
     Write-Host "`n--- Section 4: Tier 2 Device Call Decisions ---"
     foreach ($s in $Sites) {
-        $d = $DeviceMap[$s.siteId]
+        $d     = $DeviceMap[$s.siteId]
+        $label = if (-not [string]::IsNullOrWhiteSpace($s.meta.desc)) { $s.meta.desc } else { $s.meta.name }
         if ($null -eq $d) {
-            Write-Host "  SKIPPED   $($s.meta.name) (passed Tier 1 clean)"
+            Write-Host "  SKIPPED   $label (passed Tier 1 clean)"
         } elseif ($d -eq 'ERROR') {
-            Write-Host "  ERROR     $($s.meta.name) (device fetch failed)"
+            Write-Host "  ERROR     $label (device fetch failed)"
         } else {
-            Write-Host "  FETCHED   $($s.meta.name) ($($d.Count) device(s))"
+            Write-Host "  FETCHED   $label ($($d.Count) device(s))"
         }
     }
 
     Write-Host "`n--- Section 5: Full Device List (Tier 2 sites) ---"
     foreach ($s in $Sites) {
-        $d = $DeviceMap[$s.siteId]
+        $d     = $DeviceMap[$s.siteId]
+        $label = if (-not [string]::IsNullOrWhiteSpace($s.meta.desc)) { $s.meta.desc } else { $s.meta.name }
         if ($d -and $d -ne 'ERROR') {
-            Write-Host "  $($s.meta.name):"
+            Write-Host "  ${label}:"
             foreach ($dev in $d) {
                 Write-Host ("    [{0,-7}] {1} ({2}) mac={3}" -f $dev.status, $dev.name, $dev.model, $dev.mac)
             }
