@@ -175,6 +175,13 @@ function Get-UniFiSites {
 
     if ($TestMode) {
         Write-Host "`n=== SITES ($($sites.Count)) ==="
+        # Dump all meta fields on the first site so we can see what the API returns
+        if ($sites.Count -gt 0) {
+            Write-Host "  [DEBUG] First site meta fields:"
+            $sites[0].meta.PSObject.Properties | ForEach-Object {
+                Write-Host "    $($_.Name) = $($_.Value)"
+            }
+        }
         foreach ($s in $sites) {
             $counts = $s.statistics.counts
             Write-Host ("  [{0}]  hostId={1}  total={2}  offline={3}  gw_offline={4}" -f
