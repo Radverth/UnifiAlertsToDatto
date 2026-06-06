@@ -768,7 +768,7 @@ function Write-TestOutput {
     Write-Host "`n--- Section 3: Tier 1 Site Counts ---"
     foreach ($s in $Sites) {
         $c     = $s.statistics.counts
-        $label = if (-not [string]::IsNullOrWhiteSpace($s.meta.desc)) { $s.meta.desc } else { $s.meta.name }
+        $label = $HealthMap[$s.siteId].SiteName
         Write-Host ("  {0,-35} total={1}  offline={2}  gw_offline={3}  ap_offline={4}  sw_offline={5}" -f
             $label, $c.totalDevice, $c.offlineDevice, $c.offlineGatewayDevice, $c.offlineWifiDevice, $c.offlineWiredDevice)
     }
@@ -776,7 +776,7 @@ function Write-TestOutput {
     Write-Host "`n--- Section 4: Tier 2 Device Call Decisions ---"
     foreach ($s in $Sites) {
         $d     = $DeviceMap[$s.siteId]
-        $label = if (-not [string]::IsNullOrWhiteSpace($s.meta.desc)) { $s.meta.desc } else { $s.meta.name }
+        $label = $HealthMap[$s.siteId].SiteName
         if ($null -eq $d) {
             Write-Host "  SKIPPED   $label (passed Tier 1 clean)"
         } elseif ($d -eq 'ERROR') {
@@ -789,7 +789,7 @@ function Write-TestOutput {
     Write-Host "`n--- Section 5: Full Device List (Tier 2 sites) ---"
     foreach ($s in $Sites) {
         $d     = $DeviceMap[$s.siteId]
-        $label = if (-not [string]::IsNullOrWhiteSpace($s.meta.desc)) { $s.meta.desc } else { $s.meta.name }
+        $label = $HealthMap[$s.siteId].SiteName
         if ($d -and $d -ne 'ERROR') {
             Write-Host "  ${label}:"
             foreach ($dev in $d) {
@@ -803,9 +803,8 @@ function Write-TestOutput {
         Write-Host "  No WAN metrics available (sites may have no gateway or statistics)."
     }
     foreach ($siteId in $MetricsMap.Keys) {
-        $m = $MetricsMap[$siteId]
-        $s = $Sites | Where-Object { $_.siteId -eq $siteId }
-        $lbl = if (-not [string]::IsNullOrWhiteSpace($s.meta.desc)) { $s.meta.desc } else { $s.meta.name }
+        $m   = $MetricsMap[$siteId]
+        $lbl = $HealthMap[$siteId].SiteName
         Write-Host ("  {0,-35} isp={1,-22} wanUptime={2}%  txRetry={3}%" -f
             $lbl, $m.IspName, $m.WanUptimePct, $m.TxRetryPct)
     }
