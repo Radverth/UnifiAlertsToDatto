@@ -20,8 +20,10 @@
       - The company's primary contact (Contacts.isPrimaryContact = true) is
         attached to the ticket; if the company has no primary contact the
         contact field is left blank.
-      - Optionally checks that the company holds a specific contract and
-        assigns the ticket to it — see $AssignContract / $DesiredContract.
+      - Optionally checks that the company holds a specific contract,
+        assigns the ticket to it ($AssignContract) and/or raises tickets
+        only for companies holding that contract ($FilterByContract) —
+        see $DesiredContract.
       - Queue, issue type and sub-issue type are mapped per alert category
         via $TicketCategoryMap; priority is mapped per severity via
         $TicketPriorityMap.
@@ -108,27 +110,38 @@ $CompanyNameMap = @{
 # in the description; if $null, the alert is skipped with an error logged.
 $FallbackCompanyID = 0
 
-# --- Contract Assignment ---
-# When $AssignContract is $true the script queries the company's contracts
-# (Autotask Contracts entity) before raising the ticket and sets the ticket's
-# contractID when a match is found.
+# --- Contract Checking ---
+# Two independent toggles share the same contract lookup:
+#
+# $AssignContract   — when $true, the matching contract's id is written to
+#                     the ticket's contractID field. If no match is found the
+#                     ticket is still created (without a contract) and a note
+#                     is added to the description.
+#
+# $FilterByContract — when $true, tickets are ONLY raised for companies that
+#                     hold the desired contract. Alerts for companies without
+#                     a matching active contract are skipped and logged as
+#                     FILTERED (a normal outcome, not an error). Requires
+#                     $DesiredContract to be a contract name or ID.
 #
 # $DesiredContract accepts either:
-#   - a numeric contract ID  (e.g. 29684123) — verified to belong to the company
-#   - a contract name        (e.g. 'Managed Services') — matched per company
-#   - ''                     — falls back to the company's default contract
-#                              (Contracts.isDefaultContract = true)
+#   - a numeric contract ID  (e.g. 29684123) — verified to belong to the
+#                            company, so effectively limits to one company
+#   - a contract name        (e.g. 'Managed Services') — matched per company,
+#                            the usual choice for filtering across clients
+#   - ''                     — the company's default contract
+#                              (isDefaultContract = true; not allowed when
+#                              $FilterByContract is on)
 # Only contracts whose status is "active/in effect" are considered
 # ($ContractActiveStatus — 1 in a default Autotask instance).
 #
-# If no matching contract is found the behaviour depends on
-# $RequireContractMatch: $true = skip the alert and log an error;
-# $false = create the ticket without a contract (Autotask then applies its
-# own default-contract logic) and add a note to the description.
+# Note: when $FilterByContract is on, alerts that fell back to
+# $FallbackCompanyID are also filtered unless that company holds the
+# desired contract.
 $AssignContract        = $false
+$FilterByContract      = $false
 $DesiredContract       = ''      # contract ID, contract name, or '' for the company default
 $ContractActiveStatus  = 1       # Contracts.status picklist value for "In Effect"
-$RequireContractMatch  = $false
 
 # --- Ticket Field Mapping ---
 # All values below are Autotask picklist integers and are INSTANCE-SPECIFIC.
@@ -1373,6 +1386,8 @@ function Submit-AutotaskTickets {
         exit 0
     }
 
+    Assert-ContractConfig
+
     $creds   = Get-AutotaskCredentials
     $baseUrl = Get-AutotaskBaseUrl -Credentials $creds
 
@@ -1381,6 +1396,7 @@ function Submit-AutotaskTickets {
     $contractCache = @{}
     $created       = 0
     $skipped       = 0
+    $filtered      = 0
     $failed        = 0
 
     Write-Host "UniFi Health Monitor — $($Alerts.Count) alert(s) to raise as Autotask tickets."
@@ -1404,6 +1420,32 @@ function Submit-AutotaskTickets {
                 continue
             }
 
+            # Contract lookup — used by the contract filter and/or assignment.
+            # Runs before the duplicate check and contact lookup so filtered
+            # companies cost a single query per run.
+            $contractId = $null
+            if ($FilterByContract -or $AssignContract) {
+                $contract = Resolve-AutotaskContract -CompanyId $companyId -Credentials $creds -BaseApiUrl $baseUrl -Cache $contractCache
+
+                if ($null -eq $contract -and $FilterByContract) {
+                    Write-Host "  FILTERED: company has no active contract matching '$DesiredContract' — no ticket raised."
+                    $filtered++
+                    continue
+                }
+
+                if ($null -ne $contract) {
+                    if ($AssignContract) {
+                        $contractId = $contract.Id
+                        Write-Host "  Contract: '$($contract.Name)' (id=$($contract.Id)) — assigned to ticket"
+                    } else {
+                        Write-Host "  Contract: '$($contract.Name)' (id=$($contract.Id)) — filter passed"
+                    }
+                } else {
+                    $companyNote += "NOTE: No active contract matching '$DesiredContract' was found for this company — ticket created without a contract.`n"
+                    Write-Host "  Contract: no match for '$DesiredContract' — ticket created without a contract."
+                }
+            }
+
             if ($SkipIfOpenDuplicate) {
                 $dupTitle = $alert.Title
                 if ($dupTitle.Length -gt 255) { $dupTitle = $dupTitle.Substring(0, 252) + '...' }
@@ -1420,22 +1462,6 @@ function Submit-AutotaskTickets {
                 Write-Host "  Contact: none (company has no primary contact — left blank)"
             }
 
-            $contractId = $null
-            if ($AssignContract) {
-                $contract = Resolve-AutotaskContract -CompanyId $companyId -Credentials $creds -BaseApiUrl $baseUrl -Cache $contractCache
-                if ($null -ne $contract) {
-                    $contractId = $contract.Id
-                    Write-Host "  Contract: '$($contract.Name)' (id=$contractId)"
-                } elseif ($RequireContractMatch) {
-                    Write-Host "  ERROR: No active contract matching '$DesiredContract' for companyID $companyId — alert skipped (`$RequireContractMatch is on)."
-                    $failed++
-                    continue
-                } else {
-                    $companyNote += "NOTE: No active contract matching '$DesiredContract' was found for this company — ticket created without a contract.`n"
-                    Write-Host "  Contract: no match for '$DesiredContract' — ticket created without a contract."
-                }
-            }
-
             $body   = Build-AutotaskTicketBody -Alert $alert -CompanyId $companyId -ContactId $contactId -ContractId $contractId -CompanyNote $companyNote
             $result = Invoke-AutotaskApi -Method 'POST' -Path 'Tickets' -Body $body -Credentials $creds -BaseApiUrl $baseUrl
 
@@ -1447,9 +1473,20 @@ function Submit-AutotaskTickets {
         }
     }
 
-    Write-Host "`nSummary: $created created, $skipped skipped (open duplicates), $failed failed."
+    Write-Host "`nSummary: $created created, $skipped skipped (open duplicates), $filtered filtered (no matching contract), $failed failed."
 
     if ($failed -gt 0) { exit 1 } else { exit 0 }
+}
+
+function Assert-ContractConfig {
+    <#
+    Filtering by "the company's default contract" is meaningless — every
+    company with any default contract would pass — so the filter requires an
+    explicit contract name or ID.
+    #>
+    if ($FilterByContract -and [string]::IsNullOrWhiteSpace("$DesiredContract")) {
+        throw "`$FilterByContract is enabled but `$DesiredContract is empty — set it to a contract name or contract ID."
+    }
 }
 
 function Show-AutotaskPicklists {
@@ -1619,12 +1656,13 @@ function Write-TestOutput {
                     } else {
                         Write-Host "CONTACT:      none (no primary contact — would be left blank)"
                     }
-                    if ($AssignContract) {
+                    if ($FilterByContract -or $AssignContract) {
                         $contract = Resolve-AutotaskContract -CompanyId $company.Id -Credentials $atCreds -BaseApiUrl $atBaseUrl -Cache $contractCache
                         if ($null -ne $contract) {
-                            Write-Host "CONTRACT:     '$($contract.Name)' (id=$($contract.Id))"
-                        } elseif ($RequireContractMatch) {
-                            Write-Host "CONTRACT:     NO MATCH for '$DesiredContract' — alert would be SKIPPED (`$RequireContractMatch is on)"
+                            $action = if ($AssignContract) { 'would be assigned to ticket' } else { 'filter passed' }
+                            Write-Host "CONTRACT:     '$($contract.Name)' (id=$($contract.Id)) — $action"
+                        } elseif ($FilterByContract) {
+                            Write-Host "CONTRACT:     NO MATCH for '$DesiredContract' — this alert would be FILTERED (no ticket raised)"
                         } else {
                             Write-Host "CONTRACT:     no match for '$DesiredContract' — ticket would be created without a contract"
                         }
@@ -1654,6 +1692,8 @@ function Write-TestOutput {
 
 function Main {
     try {
+        Assert-ContractConfig
+
         $apiKey     = Get-UniFiApiKey
         $siteFilter = Get-ProactiveSiteFilter
         $hosts      = Get-UniFiHosts -ApiKey $apiKey -SiteFilter $siteFilter

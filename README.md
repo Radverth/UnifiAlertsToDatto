@@ -82,7 +82,7 @@ The tenant-specific API zone is resolved automatically via the `zoneInformation`
 
 - **Company** — the UniFi site name is mapped to an Autotask company name via `$CompanyNameMap`; sites without a map entry are looked up by their UniFi site name verbatim. If no company matches, the ticket is raised against `$FallbackCompanyID` (default `0`, your own account) with a note in the description, or skipped if that is `$null`.
 - **Contact** — the company's active primary contact (`isPrimaryContact`) is attached when one exists; otherwise the contact field is left blank.
-- **Contract** *(optional)* — with `$AssignContract = $true`, the script checks the company's active contracts and sets the ticket's `contractID`. `$DesiredContract` accepts a numeric contract ID (verified to belong to the company), a contract name, or `''` for the company's default contract. `$RequireContractMatch` decides whether a missing match skips the alert (`$true`) or creates the ticket without a contract and notes it (`$false`, default).
+- **Contract** *(optional)* — two independent toggles share one lookup against the company's active contracts. With `$AssignContract = $true` the matching contract is written to the ticket's `contractID` (no match = ticket still created, with a note). With `$FilterByContract = $true` tickets are **only raised for companies holding the desired contract** — alerts for companies without it are skipped as a normal outcome (logged as `FILTERED`, not an error). `$DesiredContract` accepts a numeric contract ID (verified to belong to the company), a contract name (the usual choice for filtering, since each client's contract has its own ID), or `''` for the company's default contract (assignment only — the filter requires an explicit name or ID).
 - **Fields** — priority is mapped per severity (`$TicketPriorityMap`); queue, issue type, and sub-issue type are mapped per alert category (`$TicketCategoryMap`). Values left `$null` are omitted so Autotask defaults and workflow rules apply. Status, source, and due date are set via `$TicketStatusNew`, `$TicketSource`, and `$TicketDueHours`.
 - **Duplicate suppression** (`$SkipIfOpenDuplicate`, default on) — before creating a ticket, the script checks for an open ticket with the same title against the same company and skips it, so an ongoing fault does not spawn a new ticket every poll cycle.
 
@@ -116,9 +116,9 @@ The script exits `0` when all tickets were created (or none were needed) and `1`
 | `$MergeAlerts` | `$true` | One ticket per site instead of one per issue |
 | `$CompanyNameMap` | `@{}` | UniFi site name → Autotask company name |
 | `$FallbackCompanyID` | `0` | Company used when no match is found (`$null` = skip) |
-| `$AssignContract` | `$false` | Toggle contract checking/assignment |
+| `$AssignContract` | `$false` | Assign the matching contract to the ticket |
+| `$FilterByContract` | `$false` | Only raise tickets for companies holding the desired contract |
 | `$DesiredContract` | `''` | Contract ID, contract name, or `''` for the company default |
-| `$RequireContractMatch` | `$false` | Skip the alert when no contract matches |
 | `$TicketPriorityMap` | Critical=1, Warning=2 | Severity → priority picklist value |
 | `$TicketCategoryMap` | all `$null` | Category → queue / issue type / sub-issue type |
 | `$TicketStatusNew` | `1` | Status for new tickets |
