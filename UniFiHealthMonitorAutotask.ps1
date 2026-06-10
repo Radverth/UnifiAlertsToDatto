@@ -3,16 +3,25 @@
 .SYNOPSIS
     UniFi Health Monitor for Autotask PSA — polls all managed UniFi sites via
     the Site Manager API and raises Autotask tickets through the Autotask
-    REST API instead of Datto RMM alerts.
+    REST API for any health issues detected.
 
 .DESCRIPTION
-    Differences from UniFiHealthMonitor.ps1 (the Datto RMM alert version):
-      - Alerts are converted into Autotask tickets via POST /V1.0/Tickets.
+    Designed to run as a standalone scheduled script (Windows Task Scheduler,
+    cron, or any automation platform). Credentials and filters are read from
+    environment variables by default, or can be set inline for local testing.
+
+    What it does:
+      - Polls the UniFi Site Manager API for controller connectivity, offline
+        devices, WAN uptime and TX retry rates across all managed sites
+        (optionally filtered via the UniFiNetworks environment variable).
+      - Converts detected issues into Autotask tickets via POST /V1.0/Tickets.
       - UniFi site names are mapped to Autotask company names via
         $CompanyNameMap (falls back to using the UniFi site name verbatim).
       - The company's primary contact (Contacts.isPrimaryContact = true) is
         attached to the ticket; if the company has no primary contact the
         contact field is left blank.
+      - Optionally checks that the company holds a specific contract and
+        assigns the ticket to it — see $AssignContract / $DesiredContract.
       - Queue, issue type and sub-issue type are mapped per alert category
         via $TicketCategoryMap; priority is mapped per severity via
         $TicketPriorityMap.
@@ -27,7 +36,7 @@
       - Create ticket: POST {zoneUrl}V1.0/Tickets
         Required fields: companyID, title (max 255), status, priority, dueDateTime.
         Optional fields used here: queueID, issueType, subIssueType, source,
-        contactID, description (max 8000), ticketType.
+        contactID, contractID, description (max 8000).
       - Queries: POST {zoneUrl}V1.0/<Entity>/query with a JSON filter body,
         e.g. {"filter":[{"op":"eq","field":"companyName","value":"ACME"}]}.
       - Picklist values (status, priority, queue, issue types, source) are
@@ -35,7 +44,7 @@
         the valid values for your Autotask instance.
 
 .NOTES
-    Affinity IT · Internal Technical Documentation · June 2026 · v1
+    Affinity IT · Internal Technical Documentation · June 2026 · v2
     Firmware monitoring intentionally excluded (auto-updates enabled on all sites).
 #>
 
@@ -46,10 +55,10 @@
 # --- Mode & UniFi API Key ---
 $TestMode          = $true       # $true = terminal output, no tickets created, no exit
 $MergeAlerts       = $true       # $true = one ticket per site; $false = one per alert
-$ApiKeySource      = 'SiteVar'   # 'SiteVar' = $env:UniFiApiKey | 'Script' = $ScriptApiKey
+$ApiKeySource      = 'Env'       # 'Env' = environment variable | 'Script' = $ScriptApiKey
 $ScriptApiKey      = ''          # Local testing only — never deploy with a value here
-$DattoSiteVarName  = 'UniFiApiKey'   # Datto site or global variable name for the UniFi API key
-$DattoNetworksVarName = 'UniFiNetworks' # Datto site variable: "HostID|SiteID,HostID2|SiteID2,..."
+$UniFiApiKeyVarName   = 'UniFiApiKey'   # Environment variable holding the UniFi API key
+$UniFiNetworksVarName = 'UniFiNetworks' # Optional env variable: "HostID|SiteID,HostID2|SiteID2,..."
 $UseTwoTierDeviceCheck = $true   # $false = always fetch full device detail
 
 # --- Alert Thresholds ---
@@ -69,10 +78,10 @@ $BaseUrl = 'https://api.ui.com/v1'
 # ==============================================================================
 
 # --- Credentials ---
-# 'SiteVar' reads the three values below from Datto site/global variables
-# (environment variables at runtime). 'Script' uses the inline values —
-# local testing only, never deploy with secrets in the script body.
-$AutotaskCredSource           = 'SiteVar'
+# 'Env' reads the three values below from environment variables.
+# 'Script' uses the inline values — local testing only, never deploy with
+# secrets in the script body.
+$AutotaskCredSource           = 'Env'
 $AutotaskUserVarName          = 'AutotaskApiUser'            # API user email, e.g. abcdef@yourdomain.co.uk
 $AutotaskSecretVarName        = 'AutotaskApiSecret'          # API user password/secret
 $AutotaskIntegrationVarName   = 'AutotaskApiIntegrationCode' # API tracking identifier
@@ -98,6 +107,28 @@ $CompanyNameMap = @{
 # own MSP account in Autotask), the ticket is raised against it with a note
 # in the description; if $null, the alert is skipped with an error logged.
 $FallbackCompanyID = 0
+
+# --- Contract Assignment ---
+# When $AssignContract is $true the script queries the company's contracts
+# (Autotask Contracts entity) before raising the ticket and sets the ticket's
+# contractID when a match is found.
+#
+# $DesiredContract accepts either:
+#   - a numeric contract ID  (e.g. 29684123) — verified to belong to the company
+#   - a contract name        (e.g. 'Managed Services') — matched per company
+#   - ''                     — falls back to the company's default contract
+#                              (Contracts.isDefaultContract = true)
+# Only contracts whose status is "active/in effect" are considered
+# ($ContractActiveStatus — 1 in a default Autotask instance).
+#
+# If no matching contract is found the behaviour depends on
+# $RequireContractMatch: $true = skip the alert and log an error;
+# $false = create the ticket without a contract (Autotask then applies its
+# own default-contract logic) and add a note to the description.
+$AssignContract        = $false
+$DesiredContract       = ''      # contract ID, contract name, or '' for the company default
+$ContractActiveStatus  = 1       # Contracts.status picklist value for "In Effect"
+$RequireContractMatch  = $false
 
 # --- Ticket Field Mapping ---
 # All values below are Autotask picklist integers and are INSTANCE-SPECIFIC.
@@ -144,14 +175,14 @@ function Get-UniFiApiKey {
     if ($ApiKeySource -eq 'Script') {
         $key = $ScriptApiKey
     } else {
-        # Try Datto site variable first, then global (machine-level) variable as fallback
-        $key = [System.Environment]::GetEnvironmentVariable($DattoSiteVarName, 'Process')
+        # Try the process-level environment variable first, then machine-level as fallback
+        $key = [System.Environment]::GetEnvironmentVariable($UniFiApiKeyVarName, 'Process')
         if ([string]::IsNullOrWhiteSpace($key)) {
-            $key = [System.Environment]::GetEnvironmentVariable($DattoSiteVarName, 'Machine')
+            $key = [System.Environment]::GetEnvironmentVariable($UniFiApiKeyVarName, 'Machine')
         }
     }
     if ([string]::IsNullOrWhiteSpace($key)) {
-        throw "API key is empty. Set Datto site variable '$DattoSiteVarName' (or a global/account-level variable with the same name), or set `$ApiKeySource = 'Script'` with `$ScriptApiKey."
+        throw "API key is empty. Set environment variable '$UniFiApiKeyVarName', or set `$ApiKeySource = 'Script'` with `$ScriptApiKey."
     }
     return $key
 }
@@ -209,7 +240,7 @@ function Invoke-UniFiApi {
             }
 
             if ($statusCode -eq 401) {
-                throw "Invalid API key — check Datto site variable '$DattoSiteVarName'."
+                throw "Invalid API key — check environment variable '$UniFiApiKeyVarName'."
             }
 
             if ($statusCode -eq 502 -and $Uri -like '*/isp-metrics/*') {
@@ -298,7 +329,7 @@ function Get-UniFiSites {
 
     $sites = Get-AllPages -Uri "$BaseUrl/sites" -ApiKey $ApiKey
 
-    # Filter to exact host/site pairs from the Datto variable (PowerShell-side only —
+    # Filter to exact host/site pairs from the networks variable (PowerShell-side only —
     # the /v1/sites endpoint does not support hostIds query params).
     if ($null -ne $SiteFilter -and $SiteFilter.Count -gt 0) {
         $filtered = @($sites | Where-Object {
@@ -315,7 +346,7 @@ function Get-UniFiSites {
         })
 
         if ($filtered.Count -eq 0) {
-            Write-Host "WARNING: $DattoNetworksVarName produced no matching sites — monitoring all sites as fallback."
+            Write-Host "WARNING: $UniFiNetworksVarName produced no matching sites — monitoring all sites as fallback."
         } else {
             $sites = $filtered
         }
@@ -923,13 +954,13 @@ function Merge-Alerts {
 
 function Get-ProactiveSiteFilter {
     <#
-    Reads the Datto site variable $DattoNetworksVarName (e.g. "UniFiNetworks") which
+    Reads the environment variable $UniFiNetworksVarName (e.g. "UniFiNetworks") which
     contains a comma-separated list of "HostID|SiteID" pairs, and returns a hashtable
     keyed by hostId with a list of allowed siteIds.
 
     Returns $null if the variable is not set (caller interprets as "no filter").
     #>
-    $raw = [System.Environment]::GetEnvironmentVariable($DattoNetworksVarName, 'Process')
+    $raw = [System.Environment]::GetEnvironmentVariable($UniFiNetworksVarName, 'Process')
     if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
 
     $filter = @{}
@@ -953,9 +984,8 @@ function Get-ProactiveSiteFilter {
 
 function Get-AutotaskCredentials {
     <#
-    Resolves the Autotask API credentials from Datto site/global variables
-    (environment variables) or from inline script values, mirroring
-    Get-UniFiApiKey behaviour.
+    Resolves the Autotask API credentials from environment variables or from
+    inline script values, mirroring Get-UniFiApiKey behaviour.
     #>
     if ($AutotaskCredSource -eq 'Script') {
         $user   = $AutotaskScriptUser
@@ -973,7 +1003,7 @@ function Get-AutotaskCredentials {
     if ([string]::IsNullOrWhiteSpace($user) -or
         [string]::IsNullOrWhiteSpace($secret) -or
         [string]::IsNullOrWhiteSpace($integ)) {
-        throw "Autotask credentials are incomplete. Set Datto variables '$AutotaskUserVarName', '$AutotaskSecretVarName' and '$AutotaskIntegrationVarName', or set `$AutotaskCredSource = 'Script'` with the inline values."
+        throw "Autotask credentials are incomplete. Set environment variables '$AutotaskUserVarName', '$AutotaskSecretVarName' and '$AutotaskIntegrationVarName', or set `$AutotaskCredSource = 'Script'` with the inline values."
     }
 
     return @{
@@ -1171,6 +1201,72 @@ function Get-AutotaskPrimaryContact {
     return $contactId
 }
 
+function Resolve-AutotaskContract {
+    <#
+    Checks the contracts assigned to a company (Autotask Contracts entity)
+    and returns the one matching $DesiredContract, or $null when no match.
+
+    $DesiredContract is interpreted as:
+      - all digits  -> a contract ID; the query verifies it belongs to this
+                       company and is active, guarding against a ticket being
+                       filed under another company's contract
+      - other text  -> an exact contractName match for this company
+      - empty       -> the company's default contract (isDefaultContract = true)
+
+    Only contracts with status = $ContractActiveStatus ("In Effect") are
+    considered. Results are cached per company per run.
+    Returns @{ Id; Name } or $null.
+    #>
+    param(
+        [long]      $CompanyId,
+        [hashtable] $Credentials,
+        [string]    $BaseApiUrl,
+        [hashtable] $Cache
+    )
+
+    if ($Cache.ContainsKey($CompanyId)) { return $Cache[$CompanyId] }
+
+    $filter = @(
+        @{ op = 'eq'; field = 'companyID'; value = $CompanyId }
+        @{ op = 'eq'; field = 'status';    value = $ContractActiveStatus }
+    )
+
+    $desired = "$DesiredContract".Trim()
+    if ($desired -match '^\d+$') {
+        $filter += @{ op = 'eq'; field = 'id'; value = [long]$desired }
+    } elseif ($desired.Length -gt 0) {
+        $filter += @{ op = 'eq'; field = 'contractName'; value = $desired }
+    } else {
+        $filter += @{ op = 'eq'; field = 'isDefaultContract'; value = $true }
+    }
+
+    $query = @{
+        MaxRecords    = 2
+        IncludeFields = @('id', 'contractName', 'isDefaultContract')
+        filter        = $filter
+    }
+
+    $contract = $null
+    try {
+        $result = Invoke-AutotaskApi -Method 'POST' -Path 'Contracts/query' -Body $query -Credentials $Credentials -BaseApiUrl $BaseApiUrl
+        $items  = @($result.items)
+        if ($items.Count -ge 1) {
+            if ($items.Count -gt 1) {
+                Write-Host "WARNING: Multiple active contracts match '$desired' for companyID $CompanyId — using the first (id=$($items[0].id))."
+            }
+            $contract = @{
+                Id   = [long]$items[0].id
+                Name = $items[0].contractName
+            }
+        }
+    } catch {
+        Write-Host "WARNING: Contract lookup failed for companyID $CompanyId — $($_.Exception.Message)"
+    }
+
+    $Cache[$CompanyId] = $contract
+    return $contract
+}
+
 function Test-OpenDuplicateTicket {
     <#
     Returns $true if an open (status != complete) ticket with the same title
@@ -1221,6 +1317,7 @@ function Build-AutotaskTicketBody {
         [PSCustomObject] $Alert,
         [long]           $CompanyId,
         [object]         $ContactId,      # $null = leave blank
+        [object]         $ContractId,     # $null = omit (Autotask applies its own defaults)
         [string]         $CompanyNote = ''
     )
 
@@ -1249,6 +1346,7 @@ $($Alert.Detail)
     }
 
     if ($null -ne $ContactId) { $body['contactID'] = $ContactId }
+    if ($null -ne $ContractId) { $body['contractID'] = $ContractId }
     if ($null -ne $TicketSource) { $body['source'] = $TicketSource }
 
     $catMap = $TicketCategoryMap[$Alert.Category]
@@ -1278,11 +1376,12 @@ function Submit-AutotaskTickets {
     $creds   = Get-AutotaskCredentials
     $baseUrl = Get-AutotaskBaseUrl -Credentials $creds
 
-    $companyCache = @{}
-    $contactCache = @{}
-    $created      = 0
-    $skipped      = 0
-    $failed       = 0
+    $companyCache  = @{}
+    $contactCache  = @{}
+    $contractCache = @{}
+    $created       = 0
+    $skipped       = 0
+    $failed        = 0
 
     Write-Host "UniFi Health Monitor — $($Alerts.Count) alert(s) to raise as Autotask tickets."
 
@@ -1321,7 +1420,23 @@ function Submit-AutotaskTickets {
                 Write-Host "  Contact: none (company has no primary contact — left blank)"
             }
 
-            $body   = Build-AutotaskTicketBody -Alert $alert -CompanyId $companyId -ContactId $contactId -CompanyNote $companyNote
+            $contractId = $null
+            if ($AssignContract) {
+                $contract = Resolve-AutotaskContract -CompanyId $companyId -Credentials $creds -BaseApiUrl $baseUrl -Cache $contractCache
+                if ($null -ne $contract) {
+                    $contractId = $contract.Id
+                    Write-Host "  Contract: '$($contract.Name)' (id=$contractId)"
+                } elseif ($RequireContractMatch) {
+                    Write-Host "  ERROR: No active contract matching '$DesiredContract' for companyID $companyId — alert skipped (`$RequireContractMatch is on)."
+                    $failed++
+                    continue
+                } else {
+                    $companyNote += "NOTE: No active contract matching '$DesiredContract' was found for this company — ticket created without a contract.`n"
+                    Write-Host "  Contract: no match for '$DesiredContract' — ticket created without a contract."
+                }
+            }
+
+            $body   = Build-AutotaskTicketBody -Alert $alert -CompanyId $companyId -ContactId $contactId -ContractId $contractId -CompanyNote $companyNote
             $result = Invoke-AutotaskApi -Method 'POST' -Path 'Tickets' -Body $body -Credentials $creds -BaseApiUrl $baseUrl
 
             Write-Host "  CREATED: Autotask ticket id=$($result.itemId)"
@@ -1476,8 +1591,9 @@ function Write-TestOutput {
         Write-Host "  No alerts — no tickets would be raised."
     }
 
-    $companyCache = @{}
-    $contactCache = @{}
+    $companyCache  = @{}
+    $contactCache  = @{}
+    $contractCache = @{}
 
     foreach ($a in $FinalAlerts) {
         Write-Host $sep
@@ -1502,6 +1618,16 @@ function Write-TestOutput {
                         Write-Host "CONTACT:      primary contact id=$contactId"
                     } else {
                         Write-Host "CONTACT:      none (no primary contact — would be left blank)"
+                    }
+                    if ($AssignContract) {
+                        $contract = Resolve-AutotaskContract -CompanyId $company.Id -Credentials $atCreds -BaseApiUrl $atBaseUrl -Cache $contractCache
+                        if ($null -ne $contract) {
+                            Write-Host "CONTRACT:     '$($contract.Name)' (id=$($contract.Id))"
+                        } elseif ($RequireContractMatch) {
+                            Write-Host "CONTRACT:     NO MATCH for '$DesiredContract' — alert would be SKIPPED (`$RequireContractMatch is on)"
+                        } else {
+                            Write-Host "CONTRACT:     no match for '$DesiredContract' — ticket would be created without a contract"
+                        }
                     }
                 } else {
                     Write-Host "COMPANY:      NOT FOUND for site '$($a.SiteName)' — would use fallback companyID $FallbackCompanyID. Add a `$CompanyNameMap entry."
